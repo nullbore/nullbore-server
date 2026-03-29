@@ -87,7 +87,10 @@ func TestCreateTunnelNoAuth(t *testing.T) {
 	defer ts.Close()
 
 	payload := `{"local_port": 8080}`
-	resp, _ := http.Post(ts.URL+"/v1/tunnels", "application/json", bytes.NewBufferString(payload))
+	resp, err := http.Post(ts.URL+"/v1/tunnels", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 401 {
@@ -104,7 +107,8 @@ func TestCreateTunnelInvalidPort(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 400 {
@@ -126,7 +130,8 @@ func TestListTunnels(t *testing.T) {
 
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/tunnels", nil)
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -148,7 +153,8 @@ func TestCloseTunnel(t *testing.T) {
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels", bytes.NewBufferString(payload))
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 
 	var tun tunnel.Tunnel
 	json.NewDecoder(resp.Body).Decode(&tun)
@@ -156,7 +162,8 @@ func TestCloseTunnel(t *testing.T) {
 
 	req, _ = http.NewRequest("DELETE", ts.URL+"/v1/tunnels/"+tun.ID, nil)
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
-	resp, _ = http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -165,7 +172,8 @@ func TestCloseTunnel(t *testing.T) {
 
 	req, _ = http.NewRequest("GET", ts.URL+"/v1/tunnels/"+tun.ID, nil)
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
-	resp2, _ := http.DefaultClient.Do(req)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 	defer resp2.Body.Close()
 
 	if resp2.StatusCode != 404 {
@@ -181,7 +189,8 @@ func TestExtendTunnel(t *testing.T) {
 	req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels", bytes.NewBufferString(payload))
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 
 	var tun tunnel.Tunnel
 	json.NewDecoder(resp.Body).Decode(&tun)
@@ -191,7 +200,8 @@ func TestExtendTunnel(t *testing.T) {
 	req, _ = http.NewRequest("POST", ts.URL+"/v1/tunnels/"+tun.ID+"/extend", bytes.NewBufferString(extPayload))
 	req.Header.Set("Authorization", "Bearer nbk_test_secret")
 	req.Header.Set("Content-Type", "application/json")
-	resp, _ = http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
@@ -204,7 +214,8 @@ func TestProxyNoTunnel(t *testing.T) {
 	_, ts := newTestServer("nbk_test_secret")
 	defer ts.Close()
 
-	resp, _ := http.Get(ts.URL + "/t/nonexistent")
+	resp, err := http.Get(ts.URL + "/t/nonexistent")
+	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 404 {
