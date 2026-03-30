@@ -1,3 +1,7 @@
 nullbore-server
 *.exe
 /dist/
+-e nullbore-server-linux
+server
+nullbore.db
+*.db-journal

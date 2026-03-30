@@ -26,7 +26,6 @@ func Handler(cfg Config) http.Handler {
 
 	// Static files
 	staticFS, _ := fs.Sub(staticFiles, "static")
-	fileServer := http.FileServer(http.FS(staticFS))
 
 	// Auth middleware
 	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
@@ -45,8 +44,16 @@ func Handler(cfg Config) http.Handler {
 		}
 	}
 
-	// Login page (served as static file)
-	mux.Handle("GET /dash/login", fileServer)
+	// Login page — serve login file directly
+	mux.HandleFunc("GET /dash/login", func(w http.ResponseWriter, r *http.Request) {
+		data, err := fs.ReadFile(staticFS, "login")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(data)
+	})
 
 	// Login API
 	mux.HandleFunc("POST /dash/api/login", func(w http.ResponseWriter, r *http.Request) {
@@ -188,9 +195,15 @@ func Handler(cfg Config) http.Handler {
 		writeJSON(w, 200, stats)
 	}))
 
-	// Catch-all: serve static files for the SPA
+	// Main dashboard page
 	mux.HandleFunc("GET /dash/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
-		fileServer.ServeHTTP(w, r)
+		data, err := fs.ReadFile(staticFS, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(data)
 	}))
 	mux.HandleFunc("GET /dash", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/dash/", http.StatusFound)
