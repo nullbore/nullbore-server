@@ -1,12 +1,14 @@
 package api
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -18,9 +20,10 @@ type TLSConfig struct {
 	KeyFile  string
 
 	// Auto ACME (Let's Encrypt)
-	Domains  []string // e.g. ["nullbore.com", "*.nullbore.com"]
-	CacheDir string   // defaults to ~/.nullbore/certs
-	Email    string   // optional, for Let's Encrypt notifications
+	Domains    []string // e.g. ["tunnel.nullbore.com"]
+	CacheDir   string   // defaults to ~/.nullbore/certs
+	Email      string   // optional, for Let's Encrypt notifications
+	BaseDomain string   // if set, auto-cert {slug}.basedomain subdomains on demand
 }
 
 // IsEnabled returns true if any TLS mode is configured.
@@ -79,9 +82,9 @@ func (t *TLSConfig) buildACMEConfig() (*tls.Config, error) {
 	}
 
 	manager := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(cacheDir),
-		HostPolicy: autocert.HostWhitelist(t.Domains...),
+		Prompt: autocert.AcceptTOS,
+		Cache:  autocert.DirCache(cacheDir),
+		HostPolicy: t.hostPolicy(),
 	}
 
 	if t.Email != "" {
@@ -100,6 +103,37 @@ func (t *TLSConfig) buildACMEConfig() (*tls.Config, error) {
 	}()
 
 	return manager.TLSConfig(), nil
+}
+
+// hostPolicy returns an autocert.HostPolicy that accepts:
+// 1. Explicitly listed domains (from -tls-domain)
+// 2. Any {slug}.baseDomain subdomain (if BaseDomain is set)
+func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
+	// Build whitelist set for fast lookup
+	allowed := make(map[string]bool, len(t.Domains))
+	for _, d := range t.Domains {
+		allowed[d] = true
+	}
+
+	suffix := ""
+	if t.BaseDomain != "" {
+		suffix = "." + t.BaseDomain
+	}
+
+	return func(ctx context.Context, host string) error {
+		// Check explicit whitelist
+		if allowed[host] {
+			return nil
+		}
+		// Check subdomain pattern
+		if suffix != "" && strings.HasSuffix(host, suffix) {
+			slug := strings.TrimSuffix(host, suffix)
+			if slug != "" && !strings.Contains(slug, ".") {
+				return nil
+			}
+		}
+		return fmt.Errorf("host %q not allowed", host)
+	}
 }
 
 // httpRedirectHandler returns a handler that redirects HTTP to HTTPS.

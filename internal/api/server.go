@@ -28,6 +28,7 @@ type Config struct {
 	Registry    *tunnel.Registry
 	Store       *store.Store
 	DashHandler http.Handler
+	BaseDomain  string // e.g. "tunnel.nullbore.com" — enables subdomain routing
 }
 
 // Server is the main HTTP server.
@@ -84,11 +85,128 @@ func (s *Server) routes() {
 	}
 }
 
+// subdomainHandler wraps the main mux to intercept subdomain-based tunnel requests.
+// If the Host header matches {slug}.{baseDomain}, it routes to the proxy handler.
+// Otherwise it falls through to the normal mux.
+func (s *Server) subdomainHandler(next http.Handler) http.Handler {
+	if s.cfg.BaseDomain == "" {
+		return next
+	}
+	suffix := "." + s.cfg.BaseDomain
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		// Strip port if present
+		if idx := strings.LastIndex(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+
+		// Check if this is a subdomain request
+		if strings.HasSuffix(host, suffix) && host != s.cfg.BaseDomain {
+			slug := strings.TrimSuffix(host, suffix)
+			if slug != "" && !strings.Contains(slug, ".") {
+				// Rewrite as a path-based request so handleProxy can process it
+				// Set PathValue via a sub-request to the /t/{slug} route
+				s.handleSubdomainProxy(w, r, slug)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleSubdomainProxy handles proxying for subdomain-based tunnel requests.
+func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, slug string) {
+	t, ok := s.cfg.Registry.GetBySlug(slug)
+	if !ok {
+		http.Error(w, "tunnel not found", http.StatusNotFound)
+		return
+	}
+
+	if time.Now().After(t.ExpiresAt) {
+		http.Error(w, "tunnel expired", http.StatusGone)
+		return
+	}
+
+	// Reconstruct HTTP request — for subdomain proxy, the full path stays as-is
+	reqBytes := reconstructSubdomainRequest(r, slug)
+
+	var bodyBytes []byte
+	if r.Body != nil {
+		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	}
+	reqPrefix := append(reqBytes, bodyBytes...)
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "server does not support hijacking", http.StatusInternalServerError)
+		return
+	}
+
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		log.Printf("hijack error: %v", err)
+		return
+	}
+
+	if buf.Reader.Buffered() > 0 {
+		buffered := make([]byte, buf.Reader.Buffered())
+		buf.Read(buffered)
+		conn = &prefixConn{Conn: conn, prefix: buffered}
+	}
+
+	if err := s.wsHub.RelayConn(t.ID, conn, reqPrefix); err != nil {
+		log.Printf("relay error: tunnel=%s err=%v", t.ID, err)
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 24\r\n\r\ntunnel client unavailable"))
+		conn.Close()
+		return
+	}
+
+	t.AddStats(1, 0)
+}
+
+// reconstructSubdomainRequest rebuilds raw HTTP request bytes for subdomain proxying.
+// Unlike path-based proxy, the URL path stays as-is (not stripped).
+func reconstructSubdomainRequest(r *http.Request, slug string) []byte {
+	var buf bytes.Buffer
+
+	path := r.URL.Path
+	if path == "" {
+		path = "/"
+	}
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+
+	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\n", r.Method, path)
+	fmt.Fprintf(&buf, "Host: localhost\r\n")
+	fmt.Fprintf(&buf, "Connection: close\r\n")
+
+	for key, vals := range r.Header {
+		lower := strings.ToLower(key)
+		if lower == "host" || lower == "connection" {
+			continue
+		}
+		// Strip hop-by-hop headers
+		if lower == "upgrade" || lower == "transfer-encoding" ||
+			lower == "proxy-connection" || lower == "keep-alive" ||
+			lower == "te" || lower == "trailer" {
+			continue
+		}
+		for _, v := range vals {
+			fmt.Fprintf(&buf, "%s: %s\r\n", key, v)
+		}
+	}
+
+	buf.WriteString("\r\n")
+	return buf.Bytes()
+}
+
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%s", s.cfg.Host, s.cfg.Port)
 
-	// Wrap with logging middleware
-	handler := LoggingMiddleware(s.mux)
+	// Wrap with subdomain handler, then logging middleware
+	handler := LoggingMiddleware(s.subdomainHandler(s.mux))
 
 	s.httpServer = &http.Server{
 		Addr:         addr,

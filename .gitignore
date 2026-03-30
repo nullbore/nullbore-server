@@ -5,3 +5,5 @@ nullbore-server
 server
 nullbore.db
 *.db-journal
+nullbore-server-linux
+server

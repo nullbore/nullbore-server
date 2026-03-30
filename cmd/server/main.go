@@ -26,6 +26,7 @@ func main() {
 	tlsEmail := flag.String("tls-email", envOr("NULLBORE_TLS_EMAIL", ""), "Email for Let's Encrypt notifications")
 	tlsCacheDir := flag.String("tls-cache", envOr("NULLBORE_TLS_CACHE", ""), "Cert cache directory (default: ~/.nullbore/certs)")
 	apiKeys := flag.String("api-keys", envOr("NULLBORE_API_KEYS", ""), "Comma-separated API keys (dev mode)")
+	baseDomain := flag.String("base-domain", envOr("NULLBORE_BASE_DOMAIN", ""), "Base domain for subdomain routing (e.g. tunnel.nullbore.com)")
 	dbPath := flag.String("db", envOr("NULLBORE_DB", "nullbore.db"), "SQLite database path")
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
 	flag.Parse()
@@ -59,21 +60,27 @@ func main() {
 	}
 
 	tlsCfg := &api.TLSConfig{
-		CertFile: *tlsCert,
-		KeyFile:  *tlsKey,
-		Domains:  domains,
-		Email:    *tlsEmail,
-		CacheDir: *tlsCacheDir,
+		CertFile:   *tlsCert,
+		KeyFile:    *tlsKey,
+		Domains:    domains,
+		Email:      *tlsEmail,
+		CacheDir:   *tlsCacheDir,
+		BaseDomain: *baseDomain,
 	}
 
 	// Build server config
 	cfg := api.Config{
-		Host:     *host,
-		Port:     *port,
-		TLS:      tlsCfg,
-		Auth:     authProvider,
-		Registry: registry,
-		Store:    db,
+		Host:       *host,
+		Port:       *port,
+		TLS:        tlsCfg,
+		Auth:       authProvider,
+		Registry:   registry,
+		Store:      db,
+		BaseDomain: *baseDomain,
+	}
+
+	if *baseDomain != "" {
+		log.Printf("subdomain routing: *.%s", *baseDomain)
 	}
 
 	// Dashboard
