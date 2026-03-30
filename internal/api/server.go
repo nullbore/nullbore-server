@@ -12,17 +12,20 @@ import (
 	"time"
 
 	"github.com/nullbore/nullbore-server/internal/auth"
+	"github.com/nullbore/nullbore-server/internal/store"
 	"github.com/nullbore/nullbore-server/internal/tunnel"
 )
 
 // Config holds server configuration.
 type Config struct {
-	Host     string
-	Port     string
-	TLSCert  string
-	TLSKey   string
-	Auth     auth.Provider
-	Registry *tunnel.Registry
+	Host        string
+	Port        string
+	TLSCert     string
+	TLSKey      string
+	Auth        auth.Provider
+	Registry    *tunnel.Registry
+	Store       *store.Store
+	DashHandler http.Handler
 }
 
 // Server is the main HTTP server.
@@ -70,6 +73,12 @@ func (s *Server) routes() {
 	api.HandleFunc("POST /v1/tunnels/{id}/extend", s.handleExtendTunnel)
 
 	s.mux.Handle("/v1/", s.cfg.Auth.Middleware(api))
+
+	// Dashboard (if enabled)
+	if s.cfg.DashHandler != nil {
+		s.mux.Handle("/dash/", s.cfg.DashHandler)
+		s.mux.Handle("/dash", s.cfg.DashHandler)
+	}
 }
 
 func (s *Server) ListenAndServe() error {
@@ -144,6 +153,17 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Persist to store
+	if s.cfg.Store != nil {
+		s.cfg.Store.SaveTunnel(&store.TunnelRecord{
+			ID: t.ID, Slug: t.Slug, ClientID: t.ClientID,
+			LocalPort: t.LocalPort, Name: t.Name,
+			TTL: int64(ttl.Seconds()), Status: "active",
+			CreatedAt: t.CreatedAt, ExpiresAt: t.ExpiresAt,
+		})
+		s.cfg.Store.LogEvent(t.ID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
+	}
+
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -171,6 +191,10 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	if err := s.cfg.Registry.Close(id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
+	}
+	if s.cfg.Store != nil {
+		s.cfg.Store.CloseTunnel(id)
+		s.cfg.Store.LogEvent(id, "closed", "closed via API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }

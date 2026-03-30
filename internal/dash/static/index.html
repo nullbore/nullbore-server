@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NullBore Dashboard</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+  nav h1 { margin: 0; font-size: 1.2rem; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+  .stat-card { background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); padding: 1rem; text-align: center; }
+  .stat-card .value { font-size: 2rem; font-weight: bold; }
+  .stat-card .label { color: var(--pico-muted-color); font-size: 0.85rem; }
+  .status-active { color: #22c55e; }
+  .status-expired { color: var(--pico-muted-color); }
+  .status-closed { color: var(--pico-del-color); }
+  .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+  .tabs button { background: none; border: none; padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; color: var(--pico-muted-color); }
+  .tabs button.active { border-bottom-color: var(--pico-primary); color: var(--pico-color); }
+  .key-value { font-family: monospace; background: var(--pico-code-background-color); padding: 0.5rem; border-radius: 4px; word-break: break-all; margin: 0.5rem 0; }
+  .hidden { display: none; }
+  table { font-size: 0.9rem; }
+  .actions button { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+  .bytes { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<nav class="container-fluid">
+  <ul><li><strong>🕳️ NullBore</strong></li></ul>
+  <ul><li><button class="outline" onclick="logout()">Logout</button></li></ul>
+</nav>
+
+<main class="container">
+  <!-- Stats -->
+  <div class="stat-grid" id="stats"></div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="active" onclick="showTab('tunnels', this)">Tunnels</button>
+    <button onclick="showTab('keys', this)">API Keys</button>
+  </div>
+
+  <!-- Tunnels -->
+  <section id="tab-tunnels">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+      <div>
+        <select id="tunnelFilter" onchange="loadTunnels()">
+          <option value="">All</option>
+          <option value="active" selected>Active</option>
+          <option value="expired">Expired</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
+      <button class="outline" onclick="loadTunnels()">↻ Refresh</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Slug</th>
+          <th>Client</th>
+          <th>Port</th>
+          <th>Status</th>
+          <th>TTL</th>
+          <th>Requests</th>
+          <th>Traffic</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tunnelList"></tbody>
+    </table>
+  </section>
+
+  <!-- API Keys -->
+  <section id="tab-keys" class="hidden">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+      <div>
+        <input type="text" id="keyClientId" placeholder="Client ID" value="default" style="display:inline-block;width:150px;">
+        <input type="text" id="keyLabel" placeholder="Label (e.g. 'dev laptop')" style="display:inline-block;width:200px;">
+      </div>
+      <button onclick="createKey()">+ Create Key</button>
+    </div>
+    <div id="newKeyDisplay" class="hidden" role="alert">
+      <strong>New API Key (copy now — shown only once):</strong>
+      <div class="key-value" id="newKeyValue"></div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Prefix</th><th>Client</th><th>Label</th><th>Created</th><th>Last Used</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody id="keyList"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const API = '/dash/api';
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    ...opts,
+    headers: {'Content-Type': 'application/json', ...opts.headers}
+  });
+  if (res.status === 401) { window.location.href = '/dash/login'; return null; }
+  return res.json();
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+
+function timeAgo(dateStr) {
+  const d = new Date(dateStr);
+  const s = Math.floor((Date.now() - d) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+function ttlRemaining(expiresAt) {
+  const ms = new Date(expiresAt) - Date.now();
+  if (ms <= 0) return 'expired';
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return m + 'm left';
+  return Math.floor(m/60) + 'h ' + (m%60) + 'm left';
+}
+
+// Stats
+async function loadStats() {
+  const s = await api('/stats');
+  if (!s) return;
+  document.getElementById('stats').innerHTML = `
+    <div class="stat-card"><div class="value">${s.active_tunnels}</div><div class="label">Active Tunnels</div></div>
+    <div class="stat-card"><div class="value">${s.total_tunnels}</div><div class="label">Total Tunnels</div></div>
+    <div class="stat-card"><div class="value">${s.total_requests.toLocaleString()}</div><div class="label">Total Requests</div></div>
+    <div class="stat-card"><div class="value">${formatBytes(s.total_bytes_in + s.total_bytes_out)}</div><div class="label">Total Traffic</div></div>
+    <div class="stat-card"><div class="value">${s.active_keys}</div><div class="label">API Keys</div></div>
+  `;
+}
+
+// Tunnels
+async function loadTunnels() {
+  const status = document.getElementById('tunnelFilter').value;
+  const tunnels = await api('/tunnels' + (status ? '?status=' + status : ''));
+  if (!tunnels) return;
+  const tbody = document.getElementById('tunnelList');
+  if (tunnels.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--pico-muted-color)">No tunnels</td></tr>';
+    return;
+  }
+  tbody.innerHTML = tunnels.map(t => `
+    <tr>
+      <td><code>${t.slug}</code></td>
+      <td>${t.client_id}</td>
+      <td>${t.local_port}</td>
+      <td><span class="status-${t.status}">● ${t.status}</span></td>
+      <td>${t.status === 'active' ? ttlRemaining(t.expires_at) : '—'}</td>
+      <td class="bytes">${t.requests.toLocaleString()}</td>
+      <td class="bytes">${formatBytes(t.bytes_in + t.bytes_out)}</td>
+      <td>${timeAgo(t.created_at)}</td>
+      <td class="actions">${t.status === 'active' ? '<button class="outline" onclick="closeTunnel(\''+t.id+'\')">Close</button>' : ''}</td>
+    </tr>
+  `).join('');
+}
+
+async function closeTunnel(id) {
+  if (!confirm('Close this tunnel?')) return;
+  await api('/tunnels/' + id, {method: 'DELETE'});
+  loadTunnels();
+  loadStats();
+}
+
+// API Keys
+async function loadKeys() {
+  const keys = await api('/keys?client_id=default');
+  if (!keys) return;
+  const tbody = document.getElementById('keyList');
+  if (keys.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--pico-muted-color)">No API keys</td></tr>';
+    return;
+  }
+  tbody.innerHTML = keys.map(k => `
+    <tr>
+      <td><code>${k.key_prefix}...</code></td>
+      <td>${k.client_id}</td>
+      <td>${k.label || '—'}</td>
+      <td>${timeAgo(k.created_at)}</td>
+      <td>${k.last_used ? timeAgo(k.last_used) : 'never'}</td>
+      <td>${k.active ? '<span class="status-active">active</span>' : '<span class="status-closed">revoked</span>'}</td>
+      <td class="actions">${k.active ? '<button class="outline" onclick="revokeKey(\''+k.id+'\')">Revoke</button>' : ''}</td>
+    </tr>
+  `).join('');
+}
+
+async function createKey() {
+  const clientId = document.getElementById('keyClientId').value || 'default';
+  const label = document.getElementById('keyLabel').value;
+  const result = await api('/keys', {method: 'POST', body: JSON.stringify({client_id: clientId, label: label})});
+  if (!result) return;
+  document.getElementById('newKeyValue').textContent = result.key;
+  document.getElementById('newKeyDisplay').classList.remove('hidden');
+  loadKeys();
+}
+
+async function revokeKey(id) {
+  if (!confirm('Revoke this key?')) return;
+  await api('/keys/' + id, {method: 'DELETE'});
+  loadKeys();
+}
+
+// Tabs
+function showTab(tab, btn) {
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('tab-tunnels').classList.toggle('hidden', tab !== 'tunnels');
+  document.getElementById('tab-keys').classList.toggle('hidden', tab !== 'keys');
+  if (tab === 'keys') loadKeys();
+}
+
+async function logout() {
+  await api('/logout', {method: 'POST'});
+  window.location.href = '/dash/login';
+}
+
+// Init
+loadStats();
+loadTunnels();
+setInterval(loadStats, 15000);
+setInterval(() => { if (!document.getElementById('tab-tunnels').classList.contains('hidden')) loadTunnels(); }, 15000);
+</script>
+</body>
+</html>

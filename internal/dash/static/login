@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NullBore — Login</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-box { max-width: 400px; width: 100%; }
+  .logo { text-align: center; margin-bottom: 2rem; }
+  .logo h1 { margin: 0; }
+  .logo small { color: var(--pico-muted-color); }
+  .error { color: var(--pico-del-color); display: none; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+<main class="login-box">
+  <div class="logo">
+    <h1>🕳️ NullBore</h1>
+    <small>tunnel dashboard</small>
+  </div>
+  <form id="loginForm">
+    <input type="password" id="password" placeholder="Dashboard password" required autofocus>
+    <div class="error" id="error">Invalid password</div>
+    <button type="submit">Log in</button>
+  </form>
+</main>
+<script>
+document.getElementById('loginForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const pw = document.getElementById('password').value;
+  const res = await fetch('/dash/api/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw})
+  });
+  if (res.ok) {
+    window.location.href = '/dash/';
+  } else {
+    document.getElementById('error').style.display = 'block';
+  }
+};
+</script>
+</body>
+</html>
