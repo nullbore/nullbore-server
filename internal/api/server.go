@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -167,6 +168,14 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	if req.LocalPort < 1 || req.LocalPort > 65535 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "local_port must be 1-65535"})
 		return
+	}
+
+	// Validate tunnel name
+	if req.Name != "" {
+		if err := validateTunnelName(req.Name); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	ttl := 1 * time.Hour
@@ -379,6 +388,38 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 }
 
 // --- Helpers ---
+
+// Tunnel name rules:
+//   - 2-63 characters
+//   - lowercase alphanumeric + hyphens only
+//   - must start and end with alphanumeric
+//   - no consecutive hyphens
+//   - reserved names blocked (health, dash, ws, v1, api, etc.)
+var (
+	tunnelNameRe       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+	tunnelNameReserved = map[string]bool{
+		"health": true, "dash": true, "api": true,
+		"ws": true, "v1": true, "v2": true,
+		"login": true, "admin": true, "static": true,
+		"t": true, "tunnel": true, "tunnels": true,
+	}
+)
+
+func validateTunnelName(name string) error {
+	if len(name) < 2 || len(name) > 63 {
+		return fmt.Errorf("tunnel name must be 2-63 characters")
+	}
+	if !tunnelNameRe.MatchString(name) {
+		return fmt.Errorf("tunnel name must be lowercase alphanumeric with hyphens, no leading/trailing hyphens")
+	}
+	if strings.Contains(name, "--") {
+		return fmt.Errorf("tunnel name must not contain consecutive hyphens")
+	}
+	if tunnelNameReserved[name] {
+		return fmt.Errorf("tunnel name %q is reserved", name)
+	}
+	return nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
