@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,8 +21,7 @@ import (
 type Config struct {
 	Host        string
 	Port        string
-	TLSCert     string
-	TLSKey      string
+	TLS         *TLSConfig
 	Auth        auth.Provider
 	Registry    *tunnel.Registry
 	Store       *store.Store
@@ -83,22 +83,41 @@ func (s *Server) routes() {
 
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%s", s.cfg.Host, s.cfg.Port)
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      s.mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 0, // Disabled — tunnel connections are long-lived
-		IdleTimeout:  60 * time.Second,
-	}
 
 	// Wrap with logging middleware
 	handler := LoggingMiddleware(s.mux)
 
-	srv.Handler = handler
-
-	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
-		return srv.ListenAndServeTLS(s.cfg.TLSCert, s.cfg.TLSKey)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 0, // Disabled — tunnel connections are long-lived
+		IdleTimeout:  60 * time.Second,
+		// Disable HTTP/2 — our proxy handler requires Hijack(), which HTTP/2 doesn't support.
+		// This is the same approach used by chisel and similar tunnel servers.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
+
+	// TLS handling
+	if s.cfg.TLS != nil && s.cfg.TLS.IsEnabled() {
+		tlsConfig, err := s.cfg.TLS.BuildTLSConfig()
+		if err != nil {
+			return fmt.Errorf("tls setup: %w", err)
+		}
+		srv.TLSConfig = tlsConfig
+
+		if s.cfg.TLS.IsACME() {
+			// ACME mode — TLSConfig is fully managed by autocert
+			log.Printf("tls: listening on %s (ACME/Let's Encrypt)", addr)
+			return srv.ListenAndServeTLS("", "")
+		}
+
+		// Manual cert mode
+		log.Printf("tls: listening on %s (manual cert)", addr)
+		return srv.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+	}
+
+	// No TLS
 	return srv.ListenAndServe()
 }
 
@@ -306,10 +325,20 @@ func reconstructHTTPRequest(r *http.Request) []byte {
 
 	fmt.Fprintf(&buf, "%s %s %s\r\n", r.Method, path, r.Proto)
 
-	// Headers — skip hop-by-hop
+	// Host header — Go stores it in r.Host, not r.Header
+	if r.Host != "" {
+		fmt.Fprintf(&buf, "Host: %s\r\n", r.Host)
+	}
+
+	// Force Connection: close — each inbound request gets its own data WebSocket / pipe,
+	// so there's no keep-alive. Without this, HTTP/1.1 servers hold the connection open
+	// and the pipe deadlocks.
+	fmt.Fprintf(&buf, "Connection: close\r\n")
+
+	// Remaining headers — skip hop-by-hop
 	for key, vals := range r.Header {
 		switch strings.ToLower(key) {
-		case "connection", "upgrade", "proxy-connection", "te", "trailer":
+		case "connection", "upgrade", "proxy-connection", "te", "trailer", "host":
 			continue
 		}
 		for _, v := range vals {

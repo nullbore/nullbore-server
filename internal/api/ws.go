@@ -187,7 +187,7 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Now pipe bidirectionally: inbound conn ↔ data WebSocket
+	// Pipe bidirectionally: inbound conn ↔ data WebSocket
 	pipe(pc.conn, dataConn)
 }
 
