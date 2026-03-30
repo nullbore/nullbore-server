@@ -78,7 +78,7 @@ func main() {
 
 	// Dashboard
 	if *dashPassword != "" {
-		cfg.DashHandler = dash.Handler(dash.Config{
+		cfg.DashHandler = dash.EmbeddedHandler(dash.EmbeddedConfig{
 			Password: *dashPassword,
 			Store:    db,
 		})
