@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/nullbore/nullbore-server/internal/api"
 	"github.com/nullbore/nullbore-server/internal/auth"
@@ -86,10 +90,27 @@ func main() {
 	// Build and start server
 	srv := api.NewServer(cfg)
 
+	// Graceful shutdown on SIGINT/SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		log.Printf("received %s, shutting down gracefully...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("nullbore-server starting on %s:%s", *host, *port)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
 		log.Fatalf("server error: %v", err)
 	}
+	log.Printf("server stopped")
 }
 
 func envOr(key, fallback string) string {

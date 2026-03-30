@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -34,6 +35,7 @@ type Server struct {
 	mux         *http.ServeMux
 	wsHub       *WSHub
 	rateLimiter *RateLimiter
+	httpServer  *http.Server
 }
 
 func NewServer(cfg Config) *Server {
@@ -87,7 +89,7 @@ func (s *Server) ListenAndServe() error {
 	// Wrap with logging middleware
 	handler := LoggingMiddleware(s.mux)
 
-	srv := &http.Server{
+	s.httpServer = &http.Server{
 		Addr:         addr,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
@@ -97,6 +99,8 @@ func (s *Server) ListenAndServe() error {
 		// This is the same approach used by chisel and similar tunnel servers.
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
+
+	srv := s.httpServer
 
 	// TLS handling
 	if s.cfg.TLS != nil && s.cfg.TLS.IsEnabled() {
@@ -119,6 +123,15 @@ func (s *Server) ListenAndServe() error {
 
 	// No TLS
 	return srv.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the server, waiting for active connections to finish.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpServer == nil {
+		return nil
+	}
+	log.Printf("shutting down server...")
+	return s.httpServer.Shutdown(ctx)
 }
 
 // --- API Handlers ---
