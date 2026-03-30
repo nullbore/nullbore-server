@@ -162,7 +162,7 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		return
 	}
 
-	t.AddStats(1, 0)
+	t.AddRequest()
 }
 
 // reconstructSubdomainRequest rebuilds raw HTTP request bytes for subdomain proxying.
@@ -266,6 +266,7 @@ type createTunnelRequest struct {
 	LocalPort int    `json:"local_port"`
 	Name      string `json:"name,omitempty"`
 	TTL       string `json:"ttl,omitempty"`
+	IdleTTL   bool   `json:"idle_ttl,omitempty"` // If true, TTL resets on activity (idle timeout mode)
 }
 
 func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +311,10 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
+	}
+
+	if req.IdleTTL {
+		t.IdleTTL = true
 	}
 
 	// Persist to store
@@ -447,7 +452,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t.AddStats(1, 0)
+	t.AddRequest()
 }
 
 // reconstructHTTPRequest rebuilds raw HTTP request bytes from an *http.Request.

@@ -27,6 +27,9 @@ type Tunnel struct {
 	BytesOut  int64     `json:"bytes_out"`
 	Requests  int64     `json:"requests"`
 
+	IdleTTL    bool      `json:"idle_ttl,omitempty"`    // If true, TTL resets on activity
+	LastActive time.Time `json:"last_active,omitempty"` // Last time traffic was seen
+
 	// Internal — not serialized
 	conn   *websocket.Conn
 	mu     sync.Mutex
@@ -38,12 +41,43 @@ func (t *Tunnel) Mu() *sync.Mutex {
 	return &t.mu
 }
 
-// AddStats atomically updates traffic counters.
+// AddRequest increments the request counter and marks activity.
+// Called when a new inbound request arrives at the proxy handler.
+func (t *Tunnel) AddRequest() {
+	t.mu.Lock()
+	t.Requests++
+	t.touch()
+	t.mu.Unlock()
+}
+
+// AddBytes atomically updates byte counters and marks activity.
+// Called by the counting relay wrapper after a connection finishes.
+func (t *Tunnel) AddBytes(bytesIn, bytesOut int64) {
+	t.mu.Lock()
+	t.BytesIn += bytesIn
+	t.BytesOut += bytesOut
+	if bytesIn > 0 || bytesOut > 0 {
+		t.touch()
+	}
+	t.mu.Unlock()
+}
+
+// touch updates LastActive and extends TTL if in idle mode.
+// Must be called with t.mu held.
+func (t *Tunnel) touch() {
+	t.LastActive = time.Now()
+	if t.IdleTTL && !t.closed {
+		t.ExpiresAt = t.LastActive.Add(time.Duration(t.TTL))
+	}
+}
+
+// AddStats is kept for backward compatibility with tests.
 func (t *Tunnel) AddStats(bytesIn, bytesOut int64) {
 	t.mu.Lock()
 	t.BytesIn += bytesIn
 	t.BytesOut += bytesOut
 	t.Requests++
+	t.touch()
 	t.mu.Unlock()
 }
 

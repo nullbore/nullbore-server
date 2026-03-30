@@ -225,3 +225,59 @@ func TestAddStats(t *testing.T) {
 		t.Fatalf("expected Requests 2, got %d", tun.Requests)
 	}
 }
+
+func TestIdleTTLExtends(t *testing.T) {
+	r := NewRegistry()
+	tunnel, err := r.Create("client1", 8080, "", 1*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel.IdleTTL = true
+	originalExpiry := tunnel.ExpiresAt
+
+	// Wait a bit, then simulate activity
+	time.Sleep(500 * time.Millisecond)
+	tunnel.AddRequest()
+
+	// Expiry should have been extended
+	if !tunnel.ExpiresAt.After(originalExpiry) {
+		t.Errorf("expected expiry to extend, got %v (was %v)", tunnel.ExpiresAt, originalExpiry)
+	}
+}
+
+func TestNonIdleTTLDoesNotExtend(t *testing.T) {
+	r := NewRegistry()
+	tunnel, err := r.Create("client1", 8080, "", 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// IdleTTL defaults to false
+	originalExpiry := tunnel.ExpiresAt
+
+	tunnel.AddRequest()
+
+	if tunnel.ExpiresAt != originalExpiry {
+		t.Errorf("expected expiry unchanged, got %v (was %v)", tunnel.ExpiresAt, originalExpiry)
+	}
+}
+
+func TestAddBytesTracking(t *testing.T) {
+	r := NewRegistry()
+	tunnel, err := r.Create("client1", 8080, "", 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tunnel.AddBytes(1024, 2048)
+	tunnel.AddBytes(512, 256)
+
+	if tunnel.BytesIn != 1536 {
+		t.Errorf("expected BytesIn=1536, got %d", tunnel.BytesIn)
+	}
+	if tunnel.BytesOut != 2304 {
+		t.Errorf("expected BytesOut=2304, got %d", tunnel.BytesOut)
+	}
+	if tunnel.Requests != 0 {
+		t.Errorf("expected Requests=0 (AddBytes doesn't increment), got %d", tunnel.Requests)
+	}
+}

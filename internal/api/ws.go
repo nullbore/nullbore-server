@@ -51,7 +51,8 @@ type WSHub struct {
 // pendingConn holds a hijacked connection plus the reconstructed HTTP request.
 type pendingConn struct {
 	conn       net.Conn
-	reqPrefix  []byte // Reconstructed HTTP request (method, path, headers, body prefix)
+	reqPrefix  []byte  // Reconstructed HTTP request (method, path, headers, body prefix)
+	tunnelID   string  // For byte counting after relay
 }
 
 type controlConn struct {
@@ -187,8 +188,14 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Pipe bidirectionally: inbound conn ↔ data WebSocket
-	pipe(pc.conn, dataConn)
+	// Look up tunnel for byte counting
+	var t *tunnel.Tunnel
+	if pc.tunnelID != "" {
+		t, _ = h.registry.Get(pc.tunnelID)
+	}
+
+	// Pipe bidirectionally: inbound conn ↔ data WebSocket (with byte counting)
+	pipeWithStats(pc.conn, dataConn, t)
 }
 
 // sendConnection notifies the client over the control channel that a new connection needs handling.
@@ -219,6 +226,7 @@ func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) e
 	pc := &pendingConn{
 		conn:      inbound,
 		reqPrefix: reqPrefix,
+		tunnelID:  tunnelID,
 	}
 
 	// Register the pending connection
@@ -249,10 +257,45 @@ func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) e
 	return nil
 }
 
+// countingReader wraps an io.Reader and counts bytes read.
+type countingReader struct {
+	r     io.Reader
+	count int64
+	mu    sync.Mutex
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		c.count += int64(n)
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *countingReader) Count() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count
+}
+
 // pipe copies data bidirectionally between two connections.
+// If a tunnel is provided, byte counts are recorded after relay completes.
 func pipe(a, b io.ReadWriteCloser) {
+	pipeWithStats(a, b, nil)
+}
+
+// pipeWithStats copies data bidirectionally and reports byte counts to the tunnel.
+func pipeWithStats(a, b io.ReadWriteCloser, t *tunnel.Tunnel) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	// a = inbound (internet client), b = data WS (tunnel client)
+	// a→b = bytes "in" (from internet to local service)
+	// b→a = bytes "out" (from local service to internet)
+	inCounter := &countingReader{r: a}
+	outCounter := &countingReader{r: b}
 
 	cp := func(dst io.WriteCloser, src io.Reader) {
 		defer wg.Done()
@@ -260,10 +303,15 @@ func pipe(a, b io.ReadWriteCloser) {
 		dst.Close()
 	}
 
-	go cp(a, b)
-	go cp(b, a)
+	go cp(b, inCounter)  // internet → local (bytes in)
+	go cp(a, outCounter) // local → internet (bytes out)
 
 	wg.Wait()
 	a.Close()
 	b.Close()
+
+	// Report final byte counts
+	if t != nil {
+		t.AddBytes(inCounter.Count(), outCounter.Count())
+	}
 }
