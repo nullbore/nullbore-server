@@ -91,6 +91,16 @@ func main() {
 	// Start TTL reaper
 	go registry.StartReaper()
 
+	// Prune old request logs every hour (keep 7 days)
+	if db != nil {
+		go func() {
+			for {
+				time.Sleep(1 * time.Hour)
+				db.PruneRequestLog(7 * 24 * time.Hour)
+			}
+		}()
+	}
+
 	// Build TLS config
 	var domains []string
 	if *tlsDomain != "" {

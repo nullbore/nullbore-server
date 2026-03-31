@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,6 +76,7 @@ func (s *Server) routes() {
 	api.HandleFunc("GET /v1/tunnels/{id}", s.handleGetTunnel)
 	api.HandleFunc("DELETE /v1/tunnels/{id}", s.handleCloseTunnel)
 	api.HandleFunc("POST /v1/tunnels/{id}/extend", s.handleExtendTunnel)
+	api.HandleFunc("GET /v1/tunnels/{id}/requests", s.handleListRequests)
 
 	s.mux.Handle("/v1/", s.cfg.Auth.Middleware(api))
 
@@ -393,6 +395,40 @@ func (s *Server) handleExtendTunnel(w http.ResponseWriter, r *http.Request) {
 
 // --- Proxy Handler ---
 //
+func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
+
+	t, ok := s.cfg.Registry.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.ClientID != clientID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not your tunnel"})
+		return
+	}
+
+	if s.cfg.Store == nil {
+		writeJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+
+	logs, err := s.cfg.Store.ListRequests(id, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list requests"})
+		return
+	}
+	writeJSON(w, http.StatusOK, logs)
+}
+
 // Handles inbound internet traffic to /t/{slug}.
 // Hijacks the TCP connection and hands it to the WSHub for relay
 // through the tunnel client's data WebSocket.
@@ -423,6 +459,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqPrefix := append(reqBytes, bodyBytes...)
+
+	// Log request for inspection (async, non-blocking)
+	if s.cfg.Store != nil {
+		go s.logRequest(t, r, bodyBytes)
+	}
 
 	// Hijack the HTTP connection to get the raw TCP conn
 	hj, ok := w.(http.Hijacker)
@@ -542,6 +583,43 @@ func validateTunnelName(name string) error {
 		return fmt.Errorf("tunnel name %q is reserved", name)
 	}
 	return nil
+}
+
+// logRequest records request metadata for the tunnel inspection log.
+func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
+	// Build headers JSON (skip large/sensitive ones)
+	hdrs := make(map[string]string)
+	for k, vs := range r.Header {
+		lower := strings.ToLower(k)
+		if lower == "authorization" || lower == "cookie" {
+			hdrs[k] = "[redacted]"
+		} else {
+			hdrs[k] = strings.Join(vs, ", ")
+		}
+	}
+	headersJSON, _ := json.Marshal(hdrs)
+
+	// Body snippet — first 4KB
+	snippet := ""
+	if len(body) > 0 {
+		if len(body) > 4096 {
+			snippet = string(body[:4096])
+		} else {
+			snippet = string(body)
+		}
+	}
+
+	path := "/" + r.PathValue("path")
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+
+	remoteIP := r.RemoteAddr
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		remoteIP = strings.Split(fwd, ",")[0]
+	}
+
+	s.cfg.Store.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, remoteIP)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

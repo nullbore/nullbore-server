@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -69,6 +70,20 @@ func New(path string) (*Store, error) {
 	return s, nil
 }
 
+// RequestLog represents a logged HTTP request to a tunnel.
+type RequestLog struct {
+	ID        string    `json:"id"`
+	TunnelID  string    `json:"tunnel_id"`
+	Slug      string    `json:"slug"`
+	Method    string    `json:"method"`
+	Path      string    `json:"path"`
+	Headers   string    `json:"headers"` // JSON-encoded headers
+	BodySize  int64     `json:"body_size"`
+	BodySnip  string    `json:"body_snippet,omitempty"` // first 4KB
+	RemoteIP  string    `json:"remote_ip"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS tunnels (
@@ -116,6 +131,21 @@ func (s *Store) migrate() error {
 			created_at DATETIME NOT NULL,
 			expires_at DATETIME NOT NULL
 		);
+
+		CREATE TABLE IF NOT EXISTS request_log (
+			id TEXT PRIMARY KEY,
+			tunnel_id TEXT NOT NULL,
+			slug TEXT NOT NULL,
+			method TEXT NOT NULL,
+			path TEXT NOT NULL,
+			headers TEXT NOT NULL DEFAULT '{}',
+			body_size INTEGER NOT NULL DEFAULT 0,
+			body_snippet TEXT NOT NULL DEFAULT '',
+			remote_ip TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_reqlog_tunnel ON request_log(tunnel_id, created_at);
+		CREATE INDEX IF NOT EXISTS idx_reqlog_time ON request_log(created_at);
 	`)
 	return err
 }
@@ -343,6 +373,60 @@ func (s *Store) GetStats() (*DashStats, error) {
 		Scan(&stats.TotalRequests, &stats.TotalBytesIn, &stats.TotalBytesOut)
 	s.db.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE active = 1`).Scan(&stats.ActiveKeys)
 	return stats, nil
+}
+
+// --- Request log operations ---
+
+// LogRequest records an HTTP request to a tunnel.
+func (s *Store) LogRequest(tunnelID, slug, method, path, headers string, bodySize int64, bodySnippet, remoteIP string) {
+	id := hex.EncodeToString(randomBytes(16))
+	s.db.Exec(`INSERT INTO request_log (id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, tunnelID, slug, method, path, headers, bodySize, bodySnippet, remoteIP, time.Now())
+}
+
+// ListRequests returns recent request logs for a tunnel (or all if tunnelID is empty).
+func (s *Store) ListRequests(tunnelID string, limit int) ([]RequestLog, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var query string
+	var args []interface{}
+	if tunnelID != "" {
+		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at FROM request_log WHERE tunnel_id = ? ORDER BY created_at DESC LIMIT ?`
+		args = []interface{}{tunnelID, limit}
+	} else {
+		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at FROM request_log ORDER BY created_at DESC LIMIT ?`
+		args = []interface{}{limit}
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var logs []RequestLog
+	for rows.Next() {
+		var r RequestLog
+		if err := rows.Scan(&r.ID, &r.TunnelID, &r.Slug, &r.Method, &r.Path, &r.Headers, &r.BodySize, &r.BodySnip, &r.RemoteIP, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		logs = append(logs, r)
+	}
+	if logs == nil {
+		logs = []RequestLog{}
+	}
+	return logs, nil
+}
+
+// PruneRequestLog removes request logs older than the given duration.
+func (s *Store) PruneRequestLog(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	s.db.Exec(`DELETE FROM request_log WHERE created_at < ?`, cutoff)
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
 }
 
 func (s *Store) Close() error {
