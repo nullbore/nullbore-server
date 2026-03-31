@@ -35,6 +35,7 @@ type Tunnel struct {
 	mu              sync.Mutex
 	closed          bool
 	expiringWarned  bool
+	lastPing        time.Time // last control channel activity
 }
 
 // Mu returns the tunnel's mutex for external synchronization (e.g., WebSocket writes).
@@ -70,6 +71,25 @@ func (t *Tunnel) touch() {
 	if t.IdleTTL && !t.closed {
 		t.ExpiresAt = t.LastActive.Add(time.Duration(t.TTL))
 	}
+}
+
+// MarkAlive updates the last control channel activity timestamp.
+// Called on pong receipt or any control message.
+func (t *Tunnel) MarkAlive() {
+	t.mu.Lock()
+	t.lastPing = time.Now()
+	t.mu.Unlock()
+}
+
+// IsStale returns true if no control channel activity for the given duration.
+func (t *Tunnel) IsStale(timeout time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastPing.IsZero() {
+		// Never pinged — use creation time
+		return time.Since(t.CreatedAt) > timeout
+	}
+	return time.Since(t.lastPing) > timeout
 }
 
 // AddStats is kept for backward compatibility with tests.
@@ -113,12 +133,14 @@ type Registry struct {
 	tunnels      map[string]*Tunnel // keyed by ID
 	slugs        map[string]string  // slug -> ID
 	eventHandler EventHandler       // optional callback
+	limits       ConnectionLimit    // per-client limits
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
 		tunnels: make(map[string]*Tunnel),
 		slugs:   make(map[string]string),
+		limits:  DefaultLimits(),
 	}
 }
 
@@ -134,10 +156,53 @@ func (r *Registry) emit(e Event) {
 	}
 }
 
+// ConnectionLimit defines per-client tunnel limits. Zero means unlimited.
+type ConnectionLimit struct {
+	MaxTunnels int
+}
+
+// DefaultLimits returns the default connection limit (10 tunnels per client).
+func DefaultLimits() ConnectionLimit {
+	return ConnectionLimit{MaxTunnels: 10}
+}
+
+// SetLimits sets the per-client connection limits.
+func (r *Registry) SetLimits(limits ConnectionLimit) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.limits = limits
+}
+
+// CountByClient returns the number of active tunnels for a client.
+func (r *Registry) CountByClient(clientID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, t := range r.tunnels {
+		if t.ClientID == clientID {
+			count++
+		}
+	}
+	return count
+}
+
 // Create registers a new tunnel and returns it.
 func (r *Registry) Create(clientID string, localPort int, name string, ttl time.Duration) (*Tunnel, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Enforce per-client connection limit
+	if r.limits.MaxTunnels > 0 {
+		count := 0
+		for _, t := range r.tunnels {
+			if t.ClientID == clientID {
+				count++
+			}
+		}
+		if count >= r.limits.MaxTunnels {
+			return nil, fmt.Errorf("connection limit reached (%d tunnels)", r.limits.MaxTunnels)
+		}
+	}
 
 	if ttl == 0 {
 		ttl = 1 * time.Hour
@@ -302,14 +367,22 @@ func (r *Registry) StartReaper() {
 	}
 }
 
+// StaleTimeout is how long a tunnel can go without control channel activity
+// before being considered stale and reaped. Clients send pings every 25s,
+// so 90s allows for ~3 missed pings.
+const StaleTimeout = 90 * time.Second
+
 func (r *Registry) reapExpired() {
 	now := time.Now()
 	warnThreshold := 5 * time.Minute
 	r.mu.RLock()
 	var expired []string
+	var stale []string
 	for id, t := range r.tunnels {
 		if now.After(t.ExpiresAt) {
 			expired = append(expired, id)
+		} else if t.conn != nil && t.IsStale(StaleTimeout) {
+			stale = append(stale, id)
 		} else if t.ExpiresAt.Sub(now) <= warnThreshold {
 			// Fire expiring event once (check if not already warned)
 			t.mu.Lock()
@@ -326,6 +399,11 @@ func (r *Registry) reapExpired() {
 
 	for _, id := range expired {
 		log.Printf("reaping expired tunnel: %s", id)
+		r.Close(id)
+	}
+
+	for _, id := range stale {
+		log.Printf("reaping stale tunnel (no ping for %s): %s", StaleTimeout, id)
 		r.Close(id)
 	}
 }

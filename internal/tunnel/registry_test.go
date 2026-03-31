@@ -194,6 +194,7 @@ func TestReapExpired(t *testing.T) {
 
 func TestSlugUniqueness(t *testing.T) {
 	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 0}) // unlimited for this test
 	slugs := make(map[string]bool)
 
 	for i := 0; i < 100; i++ {
@@ -279,5 +280,137 @@ func TestAddBytesTracking(t *testing.T) {
 	}
 	if tunnel.Requests != 0 {
 		t.Errorf("expected Requests=0 (AddBytes doesn't increment), got %d", tunnel.Requests)
+	}
+}
+
+// --- Connection limit tests ---
+
+func TestConnectionLimitEnforced(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 3})
+
+	for i := 0; i < 3; i++ {
+		_, err := r.Create("client1", 8080+i, "", 1*time.Hour)
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	_, err := r.Create("client1", 9000, "", 1*time.Hour)
+	if err == nil {
+		t.Fatal("expected error for exceeding connection limit")
+	}
+}
+
+func TestConnectionLimitPerClient(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 2})
+
+	// Client 1 creates 2
+	r.Create("client1", 8080, "", 1*time.Hour)
+	r.Create("client1", 8081, "", 1*time.Hour)
+
+	// Client 1 is at limit
+	_, err := r.Create("client1", 8082, "", 1*time.Hour)
+	if err == nil {
+		t.Fatal("client1 should be at limit")
+	}
+
+	// Client 2 should still be able to create
+	_, err = r.Create("client2", 8080, "", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("client2 should be able to create: %v", err)
+	}
+}
+
+func TestConnectionLimitFreedAfterClose(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 1})
+
+	tun, _ := r.Create("client1", 8080, "", 1*time.Hour)
+
+	_, err := r.Create("client1", 8081, "", 1*time.Hour)
+	if err == nil {
+		t.Fatal("should be at limit")
+	}
+
+	r.Close(tun.ID)
+
+	_, err = r.Create("client1", 8081, "", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("should be able to create after close: %v", err)
+	}
+}
+
+func TestConnectionLimitUnlimited(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 0}) // unlimited
+
+	for i := 0; i < 50; i++ {
+		_, err := r.Create("client1", 8080+i, "", 1*time.Hour)
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+}
+
+func TestCountByClient(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(ConnectionLimit{MaxTunnels: 0})
+
+	if r.CountByClient("client1") != 0 {
+		t.Error("expected 0")
+	}
+
+	r.Create("client1", 8080, "", 1*time.Hour)
+	r.Create("client1", 8081, "", 1*time.Hour)
+	r.Create("client2", 8080, "", 1*time.Hour)
+
+	if r.CountByClient("client1") != 2 {
+		t.Errorf("expected 2, got %d", r.CountByClient("client1"))
+	}
+	if r.CountByClient("client2") != 1 {
+		t.Errorf("expected 1, got %d", r.CountByClient("client2"))
+	}
+}
+
+// --- Liveness tests ---
+
+func TestMarkAlive(t *testing.T) {
+	r := NewRegistry()
+	tun, _ := r.Create("client1", 8080, "", 1*time.Hour)
+
+	// Initially not stale
+	if tun.IsStale(90 * time.Second) {
+		t.Error("fresh tunnel should not be stale")
+	}
+
+	tun.MarkAlive()
+	if tun.IsStale(90 * time.Second) {
+		t.Error("just-marked tunnel should not be stale")
+	}
+}
+
+func TestIsStaleAfterTimeout(t *testing.T) {
+	r := NewRegistry()
+	tun, _ := r.Create("client1", 8080, "", 1*time.Hour)
+
+	// Mark alive, then check with very short timeout
+	tun.MarkAlive()
+	time.Sleep(10 * time.Millisecond)
+
+	if !tun.IsStale(5 * time.Millisecond) {
+		t.Error("tunnel should be stale after timeout")
+	}
+}
+
+func TestIsStaleUsesCreatedAtIfNeverPinged(t *testing.T) {
+	r := NewRegistry()
+	tun, _ := r.Create("client1", 8080, "", 1*time.Hour)
+
+	// Never pinged — uses CreatedAt
+	time.Sleep(10 * time.Millisecond)
+	if !tun.IsStale(5 * time.Millisecond) {
+		t.Error("never-pinged tunnel should be stale after creation timeout")
 	}
 }

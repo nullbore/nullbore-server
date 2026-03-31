@@ -112,9 +112,13 @@ func (h *WSHub) HandleControl(w http.ResponseWriter, r *http.Request) {
 		log.Printf("control disconnected: tunnel=%s", tunnelID)
 	}()
 
+	// Mark tunnel alive on initial connection
+	t.MarkAlive()
+
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		t.MarkAlive()
 		return nil
 	})
 
@@ -132,9 +136,10 @@ func (h *WSHub) HandleControl(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Read loop — just keep the connection alive, discard any client messages
+	// Read loop — keep the connection alive, track liveness
 	for {
 		_, _, err := conn.ReadMessage()
+		t.MarkAlive()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("control read error: tunnel=%s err=%v", tunnelID, err)

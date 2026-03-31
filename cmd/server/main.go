@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ func main() {
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
 	webhookTarget := flag.String("webhook-target", envOr("NULLBORE_WEBHOOK_TARGET", ""), "Dashboard URL for event dispatch (e.g. https://nullbore.com)")
 	webhookSecret := flag.String("webhook-secret", envOr("NULLBORE_WEBHOOK_SECRET", ""), "Shared secret for internal event dispatch")
+	maxTunnels := flag.Int("max-tunnels", envOrInt("NULLBORE_MAX_TUNNELS", 10), "Max tunnels per client (0 = unlimited)")
 	flag.Parse()
 
 	// Initialize store
@@ -49,6 +51,13 @@ func main() {
 
 	// Initialize tunnel registry
 	registry := tunnel.NewRegistry()
+	if *maxTunnels > 0 {
+		registry.SetLimits(tunnel.ConnectionLimit{MaxTunnels: *maxTunnels})
+		log.Printf("connection limits: %d tunnels per client", *maxTunnels)
+	} else {
+		registry.SetLimits(tunnel.ConnectionLimit{MaxTunnels: 0})
+		log.Printf("connection limits: unlimited")
+	}
 
 	// Register event handler for webhook dispatch
 	if *webhookTarget != "" {
@@ -157,6 +166,15 @@ func main() {
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envOrInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }
