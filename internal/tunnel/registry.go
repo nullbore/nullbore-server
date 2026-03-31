@@ -31,9 +31,10 @@ type Tunnel struct {
 	LastActive time.Time `json:"last_active,omitempty"` // Last time traffic was seen
 
 	// Internal — not serialized
-	conn   *websocket.Conn
-	mu     sync.Mutex
-	closed bool
+	conn            *websocket.Conn
+	mu              sync.Mutex
+	closed          bool
+	expiringWarned  bool
 }
 
 // Mu returns the tunnel's mutex for external synchronization (e.g., WebSocket writes).
@@ -88,17 +89,48 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf(`"%s"`, time.Duration(d).String())), nil
 }
 
+// EventType represents a tunnel lifecycle event.
+type EventType string
+
+const (
+	EventCreated  EventType = "tunnel.created"
+	EventClosed   EventType = "tunnel.closed"
+	EventExpiring EventType = "tunnel.expiring"
+)
+
+// Event is a tunnel lifecycle event.
+type Event struct {
+	Type   EventType `json:"event"`
+	Tunnel *Tunnel   `json:"tunnel"`
+}
+
+// EventHandler receives tunnel lifecycle events.
+type EventHandler func(Event)
+
 // Registry manages active tunnels.
 type Registry struct {
-	mu      sync.RWMutex
-	tunnels map[string]*Tunnel // keyed by ID
-	slugs   map[string]string  // slug -> ID
+	mu           sync.RWMutex
+	tunnels      map[string]*Tunnel // keyed by ID
+	slugs        map[string]string  // slug -> ID
+	eventHandler EventHandler       // optional callback
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
 		tunnels: make(map[string]*Tunnel),
 		slugs:   make(map[string]string),
+	}
+}
+
+// OnEvent registers a handler for tunnel lifecycle events.
+func (r *Registry) OnEvent(h EventHandler) {
+	r.eventHandler = h
+}
+
+// emit fires an event to the registered handler (non-blocking).
+func (r *Registry) emit(e Event) {
+	if r.eventHandler != nil {
+		go r.eventHandler(e)
 	}
 }
 
@@ -141,6 +173,8 @@ func (r *Registry) Create(clientID string, localPort int, name string, ttl time.
 
 	log.Printf("tunnel created: id=%s slug=%s client=%s port=%d ttl=%s",
 		t.ID, t.Slug, t.ClientID, t.LocalPort, ttl)
+
+	r.emit(Event{Type: EventCreated, Tunnel: t})
 
 	return t, nil
 }
@@ -200,6 +234,7 @@ func (r *Registry) Close(id string) error {
 	delete(r.slugs, t.Slug)
 
 	log.Printf("tunnel closed: id=%s slug=%s", t.ID, t.Slug)
+	r.emit(Event{Type: EventClosed, Tunnel: t})
 	return nil
 }
 
@@ -269,11 +304,22 @@ func (r *Registry) StartReaper() {
 
 func (r *Registry) reapExpired() {
 	now := time.Now()
+	warnThreshold := 5 * time.Minute
 	r.mu.RLock()
 	var expired []string
 	for id, t := range r.tunnels {
 		if now.After(t.ExpiresAt) {
 			expired = append(expired, id)
+		} else if t.ExpiresAt.Sub(now) <= warnThreshold {
+			// Fire expiring event once (check if not already warned)
+			t.mu.Lock()
+			if !t.expiringWarned {
+				t.expiringWarned = true
+				t.mu.Unlock()
+				r.emit(Event{Type: EventExpiring, Tunnel: t})
+			} else {
+				t.mu.Unlock()
+			}
 		}
 	}
 	r.mu.RUnlock()

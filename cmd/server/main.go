@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,6 +32,8 @@ func main() {
 	baseDomain := flag.String("base-domain", envOr("NULLBORE_BASE_DOMAIN", ""), "Base domain for subdomain routing (e.g. tunnel.nullbore.com)")
 	dbPath := flag.String("db", envOr("NULLBORE_DB", "nullbore.db"), "SQLite database path")
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
+	webhookTarget := flag.String("webhook-target", envOr("NULLBORE_WEBHOOK_TARGET", ""), "Dashboard URL for event dispatch (e.g. https://nullbore.com)")
+	webhookSecret := flag.String("webhook-secret", envOr("NULLBORE_WEBHOOK_SECRET", ""), "Shared secret for internal event dispatch")
 	flag.Parse()
 
 	// Initialize store
@@ -44,6 +49,35 @@ func main() {
 
 	// Initialize tunnel registry
 	registry := tunnel.NewRegistry()
+
+	// Register event handler for webhook dispatch
+	if *webhookTarget != "" {
+		target := *webhookTarget + "/internal/events"
+		secret := *webhookSecret
+		log.Printf("event dispatch: %s", target)
+		registry.OnEvent(func(e tunnel.Event) {
+			body, _ := json.Marshal(e)
+			req, err := http.NewRequest("POST", target, bytes.NewReader(body))
+			if err != nil {
+				log.Printf("event dispatch error: %v", err)
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if secret != "" {
+				req.Header.Set("X-Internal-Secret", secret)
+			}
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("event dispatch error: %v", err)
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				log.Printf("event dispatch: %s returned %d", target, resp.StatusCode)
+			}
+		})
+	}
 
 	// Start TTL reaper
 	go registry.StartReaper()
