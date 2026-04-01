@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,13 +40,24 @@ func main() {
 	maxTunnels := flag.Int("max-tunnels", envOrInt("NULLBORE_MAX_TUNNELS", 10), "Max tunnels per client (0 = unlimited)")
 	flag.Parse()
 
+	// Set up structured logging
+	logFormat := envOr("NULLBORE_LOG_FORMAT", "json")
+	var logHandler slog.Handler
+	if logFormat == "text" {
+		logHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	} else {
+		logHandler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	logger := slog.New(logHandler)
+	slog.SetDefault(logger)
+
 	// Initialize store
 	db, err := store.New(*dbPath)
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
 	defer db.Close()
-	log.Printf("database: %s", *dbPath)
+	slog.Info("database ready", "path", *dbPath)
 
 	// Initialize auth provider
 	// If webhook target (dashboard URL) is configured, use remote auth
@@ -55,7 +67,7 @@ func main() {
 	if *webhookTarget != "" && *webhookSecret != "" {
 		remote := auth.NewRemoteProvider(*webhookTarget, *webhookSecret)
 		remote.StartCacheReaper()
-		log.Printf("auth: remote validation via %s", *webhookTarget)
+		slog.Info("auth: remote validation", "target", *webhookTarget)
 
 		// Use a combo provider: try remote first, fall back to static
 		authProvider = &auth.ComboProvider{
@@ -64,29 +76,29 @@ func main() {
 		}
 	} else {
 		authProvider = auth.NewStaticProvider(*apiKeys)
-		log.Printf("auth: static keys")
+		slog.Info("auth: static keys")
 	}
 
 	// Initialize tunnel registry
 	registry := tunnel.NewRegistry()
 	if *maxTunnels > 0 {
 		registry.SetLimits(tunnel.ConnectionLimit{MaxTunnels: *maxTunnels})
-		log.Printf("connection limits: %d tunnels per client", *maxTunnels)
+		slog.Info("connection limits", "max_tunnels", *maxTunnels)
 	} else {
 		registry.SetLimits(tunnel.ConnectionLimit{MaxTunnels: 0})
-		log.Printf("connection limits: unlimited")
+		slog.Info("connection limits", "max_tunnels", "unlimited")
 	}
 
 	// Register event handler for webhook dispatch
 	if *webhookTarget != "" {
 		target := *webhookTarget + "/internal/events"
 		secret := *webhookSecret
-		log.Printf("event dispatch: %s", target)
+		slog.Info("event dispatch configured", "target", target)
 		registry.OnEvent(func(e tunnel.Event) {
 			body, _ := json.Marshal(e)
 			req, err := http.NewRequest("POST", target, bytes.NewReader(body))
 			if err != nil {
-				log.Printf("event dispatch error: %v", err)
+				slog.Error("event dispatch failed", "error", err)
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
@@ -96,12 +108,12 @@ func main() {
 			client := &http.Client{Timeout: 5 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
-				log.Printf("event dispatch error: %v", err)
+				slog.Error("event dispatch failed", "error", err)
 				return
 			}
 			resp.Body.Close()
 			if resp.StatusCode >= 300 {
-				log.Printf("event dispatch: %s returned %d", target, resp.StatusCode)
+				slog.Warn("event dispatch non-2xx", "target", target, "status", resp.StatusCode)
 			}
 		})
 	}

@@ -2,10 +2,12 @@ package api
 
 import (
 	"bufio"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/nullbore/nullbore-server/internal/auth"
 )
 
 // statusWriter wraps http.ResponseWriter to capture the status code.
@@ -50,12 +52,27 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		log.Printf("%s %s %d %s %d bytes",
-			r.Method,
-			r.URL.Path,
-			sw.status,
-			duration.Round(time.Microsecond),
-			sw.size,
-		)
+		attrs := []slog.Attr{
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", sw.status),
+			slog.String("duration", duration.Round(time.Microsecond).String()),
+			slog.Int("bytes", sw.size),
+		}
+		if clientID := auth.ClientIDFrom(r.Context()); clientID != "" {
+			attrs = append(attrs, slog.String("client_id", clientID))
+		}
+		if r.URL.RawQuery != "" {
+			attrs = append(attrs, slog.String("query", r.URL.RawQuery))
+		}
+
+		level := slog.LevelInfo
+		if sw.status >= 500 {
+			level = slog.LevelError
+		} else if sw.status >= 400 {
+			level = slog.LevelWarn
+		}
+
+		slog.LogAttrs(r.Context(), level, "http request", attrs...)
 	})
 }

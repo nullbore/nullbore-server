@@ -22,6 +22,12 @@ import (
 )
 
 // Config holds server configuration.
+// ServerVersion is the current API version, set at build time via -ldflags.
+var ServerVersion = "0.1.0-dev"
+
+// APIVersion is the API protocol version. Bump on breaking changes.
+const APIVersion = "1"
+
 type Config struct {
 	Host        string
 	Port        string
@@ -73,6 +79,12 @@ func (s *Server) routes() {
 
 	// REST API — all authed
 	api := http.NewServeMux()
+	api.HandleFunc("GET /v1/version", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"version":     ServerVersion,
+			"api_version": APIVersion,
+		})
+	})
 	api.HandleFunc("GET /v1/tunnels", s.handleListTunnels)
 	api.HandleFunc("POST /v1/tunnels", s.handleCreateTunnel)
 	api.HandleFunc("GET /v1/tunnels/{id}", s.handleGetTunnel)
@@ -218,9 +230,16 @@ func (s *Server) ListenAndServe() error {
 	// Wrap with subdomain handler, then logging middleware
 	handler := LoggingMiddleware(s.subdomainHandler(s.mux))
 
+	// Wrap handler to inject version headers on all responses
+	versionHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-NullBore-Version", ServerVersion)
+		w.Header().Set("X-NullBore-API", APIVersion)
+		handler.ServeHTTP(w, r)
+	})
+
 	s.httpServer = &http.Server{
 		Addr:         addr,
-		Handler:      handler,
+		Handler:      versionHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 0, // Disabled — tunnel connections are long-lived
 		IdleTimeout:  60 * time.Second,
