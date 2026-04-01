@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,7 @@ type Config struct {
 	Store       *store.Store
 	DashHandler http.Handler
 	BaseDomain  string // e.g. "tunnel.nullbore.com" — enables subdomain routing
+	AdminSecret string // shared secret for admin API (dashboard→server)
 }
 
 // Server is the main HTTP server.
@@ -79,6 +81,12 @@ func (s *Server) routes() {
 	api.HandleFunc("GET /v1/tunnels/{id}/requests", s.handleListRequests)
 
 	s.mux.Handle("/v1/", s.cfg.Auth.Middleware(api))
+
+	// Admin API — authenticated by shared secret (dashboard→server)
+	admin := http.NewServeMux()
+	admin.HandleFunc("GET /v1/admin/tunnels", s.handleAdminListTunnels)
+	admin.HandleFunc("DELETE /v1/admin/tunnels/{id}", s.handleAdminCloseTunnel)
+	s.mux.Handle("/v1/admin/", s.adminMiddleware(admin))
 
 	// Dashboard (if enabled)
 	if s.cfg.DashHandler != nil {
@@ -549,6 +557,82 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 	return c.Conn.Read(b)
+}
+
+// --- Admin API ---
+
+// adminMiddleware verifies the X-Admin-Secret header matches the configured secret.
+func (s *Server) adminMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.AdminSecret == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API not configured"})
+			return
+		}
+		secret := r.Header.Get("X-Admin-Secret")
+		if secret == "" {
+			// Also check Authorization: Bearer <secret> for flexibility
+			auth := r.Header.Get("Authorization")
+			if len(auth) > 7 && auth[:7] == "Bearer " {
+				secret = auth[7:]
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(secret), []byte(s.cfg.AdminSecret)) != 1 {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid admin secret"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleAdminListTunnels returns all live tunnels, optionally filtered by client_id.
+func (s *Server) handleAdminListTunnels(w http.ResponseWriter, r *http.Request) {
+	clientID := r.URL.Query().Get("client_id")
+	tunnels := s.cfg.Registry.List(clientID) // empty clientID = all tunnels
+	if tunnels == nil {
+		tunnels = []*tunnel.Tunnel{}
+	}
+
+	// Enrich with connection status
+	type enrichedTunnel struct {
+		*tunnel.Tunnel
+		Connected bool   `json:"connected"`
+		URL       string `json:"url,omitempty"`
+	}
+
+	result := make([]enrichedTunnel, len(tunnels))
+	for i, t := range tunnels {
+		connected := false
+		if conn, err := s.cfg.Registry.GetConn(t.ID); err == nil && conn != nil {
+			connected = true
+		}
+		url := ""
+		if s.cfg.BaseDomain != "" {
+			url = fmt.Sprintf("https://%s.%s", t.Slug, s.cfg.BaseDomain)
+		} else {
+			url = fmt.Sprintf("/t/%s", t.Slug)
+		}
+		result[i] = enrichedTunnel{
+			Tunnel:    t,
+			Connected: connected,
+			URL:       url,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleAdminCloseTunnel force-closes any tunnel by ID.
+func (s *Server) handleAdminCloseTunnel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.cfg.Registry.Close(id); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.cfg.Store != nil {
+		s.cfg.Store.CloseTunnel(id)
+		s.cfg.Store.LogEvent(id, "closed", "closed via admin API")
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }
 
 // --- Helpers ---

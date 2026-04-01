@@ -35,6 +35,7 @@ func main() {
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
 	webhookTarget := flag.String("webhook-target", envOr("NULLBORE_WEBHOOK_TARGET", ""), "Dashboard URL for event dispatch (e.g. https://nullbore.com)")
 	webhookSecret := flag.String("webhook-secret", envOr("NULLBORE_WEBHOOK_SECRET", ""), "Shared secret for internal event dispatch")
+	adminSecret := flag.String("admin-secret", envOr("NULLBORE_ADMIN_SECRET", ""), "Shared secret for admin API (dashboard→server)")
 	maxTunnels := flag.Int("max-tunnels", envOrInt("NULLBORE_MAX_TUNNELS", 10), "Max tunnels per client (0 = unlimited)")
 	flag.Parse()
 
@@ -121,15 +122,22 @@ func main() {
 		BaseDomain: *baseDomain,
 	}
 
+	// Admin secret — default to webhook secret if not set separately
+	adminSec := *adminSecret
+	if adminSec == "" {
+		adminSec = *webhookSecret
+	}
+
 	// Build server config
 	cfg := api.Config{
-		Host:       *host,
-		Port:       *port,
-		TLS:        tlsCfg,
-		Auth:       authProvider,
-		Registry:   registry,
-		Store:      db,
-		BaseDomain: *baseDomain,
+		Host:        *host,
+		Port:        *port,
+		TLS:         tlsCfg,
+		Auth:        authProvider,
+		Registry:    registry,
+		Store:       db,
+		BaseDomain:  *baseDomain,
+		AdminSecret: adminSec,
 	}
 
 	if *baseDomain != "" {
