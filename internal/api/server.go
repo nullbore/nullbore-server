@@ -279,12 +279,49 @@ type createTunnelRequest struct {
 	IdleTTL   bool   `json:"idle_ttl,omitempty"` // If true, TTL resets on activity (idle timeout mode)
 }
 
+// tierMaxTTL returns the max TTL for a tier.
+func tierMaxTTL(tier string) time.Duration {
+	switch tier {
+	case "pro":
+		return 0 // no limit (persistent)
+	case "hobby":
+		return 7 * 24 * time.Hour // 7 days
+	default: // free
+		return 2 * time.Hour
+	}
+}
+
+// tierTunnelLimit returns the max active tunnels for a tier.
+func tierTunnelLimit(tier string) int {
+	switch tier {
+	case "pro":
+		return 10
+	case "hobby":
+		return 3
+	default: // free or unknown
+		return 1
+	}
+}
+
 func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	clientID := auth.ClientIDFrom(r.Context())
 
 	// Rate limit by client ID
 	if !s.rateLimiter.Allow(clientID) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+		return
+	}
+
+	// Enforce per-tier tunnel limits
+	tier := auth.TierFrom(r.Context())
+	limit := tierTunnelLimit(tier)
+	current := s.cfg.Registry.CountByClient(clientID)
+	if current >= limit {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error": fmt.Sprintf("tunnel limit reached (%d/%d for %s tier)", current, limit, tier),
+			"limit": limit,
+			"tier":  tier,
+		})
 		return
 	}
 
@@ -315,6 +352,11 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ttl = parsed
+	}
+
+	// Enforce tier-based TTL cap (0 = no limit for pro)
+	if maxTTL := tierMaxTTL(tier); maxTTL > 0 && ttl > maxTTL {
+		ttl = maxTTL
 	}
 
 	t, err := s.cfg.Registry.Create(clientID, req.LocalPort, req.Name, ttl)

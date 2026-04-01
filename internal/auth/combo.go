@@ -44,7 +44,16 @@ func (c *ComboProvider) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		r = r.WithContext(WithClientID(r.Context(), clientID))
+		ctx := WithClientID(r.Context(), clientID)
+
+		// Try to get tier from remote provider
+		if rp, ok := c.Primary.(*RemoteProvider); ok {
+			if tier := rp.GetTier(token); tier != "" {
+				ctx = WithTier(ctx, tier)
+			}
+		}
+
+		r = r.WithContext(ctx)
 		next.ServeHTTP(w, r)
 	})
 }
