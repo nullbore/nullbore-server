@@ -366,8 +366,13 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
 	t, ok := s.cfg.Registry.Get(id)
 	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.ClientID != clientID {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
 		return
 	}
@@ -380,6 +385,16 @@ func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
+	t, ok := s.cfg.Registry.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.ClientID != clientID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
 	if err := s.cfg.Registry.Close(id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -397,6 +412,18 @@ type extendRequest struct {
 
 func (s *Server) handleExtendTunnel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
+
+	// Verify ownership before parsing request
+	t, ok := s.cfg.Registry.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.ClientID != clientID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
 
 	var req extendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -415,7 +442,7 @@ func (s *Server) handleExtendTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, _ := s.cfg.Registry.Get(id)
+	t, _ = s.cfg.Registry.Get(id)
 	writeJSON(w, http.StatusOK, t)
 }
 
