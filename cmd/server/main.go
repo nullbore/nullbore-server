@@ -48,7 +48,24 @@ func main() {
 	log.Printf("database: %s", *dbPath)
 
 	// Initialize auth provider
-	authProvider := auth.NewStaticProvider(*apiKeys)
+	// If webhook target (dashboard URL) is configured, use remote auth
+	// which validates keys against the dashboard DB. Static keys are
+	// kept as a fallback for self-hosted/dev mode.
+	var authProvider auth.Provider
+	if *webhookTarget != "" && *webhookSecret != "" {
+		remote := auth.NewRemoteProvider(*webhookTarget, *webhookSecret)
+		remote.StartCacheReaper()
+		log.Printf("auth: remote validation via %s", *webhookTarget)
+
+		// Use a combo provider: try remote first, fall back to static
+		authProvider = &auth.ComboProvider{
+			Primary:  remote,
+			Fallback: auth.NewStaticProvider(*apiKeys),
+		}
+	} else {
+		authProvider = auth.NewStaticProvider(*apiKeys)
+		log.Printf("auth: static keys")
+	}
 
 	// Initialize tunnel registry
 	registry := tunnel.NewRegistry()
