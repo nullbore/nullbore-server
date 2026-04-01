@@ -117,19 +117,22 @@ func TestCreateTunnelInvalidPort(t *testing.T) {
 }
 
 func TestListTunnels(t *testing.T) {
-	_, ts := newTestServer("nbk_test_secret")
+	// Use two different clients since free tier limits each to 1 tunnel
+	_, ts := newTestServer("nbk_clientX_key1,nbk_clientY_key2")
 	defer ts.Close()
 
-	for _, port := range []int{8080, 9090} {
+	keys := []string{"nbk_clientX_key1", "nbk_clientY_key2"}
+	for i, port := range []int{8080, 9090} {
 		payload := fmt.Sprintf(`{"local_port": %d}`, port)
 		req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels", bytes.NewBufferString(payload))
-		req.Header.Set("Authorization", "Bearer nbk_test_secret")
+		req.Header.Set("Authorization", "Bearer "+keys[i])
 		req.Header.Set("Content-Type", "application/json")
 		http.DefaultClient.Do(req)
 	}
 
+	// Client X should see 1 tunnel (their own)
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/tunnels", nil)
-	req.Header.Set("Authorization", "Bearer nbk_test_secret")
+	req.Header.Set("Authorization", "Bearer nbk_clientX_key1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil { t.Fatal(err) }
 	defer resp.Body.Close()
@@ -140,8 +143,8 @@ func TestListTunnels(t *testing.T) {
 
 	var tunnels []tunnel.Tunnel
 	json.NewDecoder(resp.Body).Decode(&tunnels)
-	if len(tunnels) != 2 {
-		t.Fatalf("expected 2 tunnels, got %d", len(tunnels))
+	if len(tunnels) != 1 {
+		t.Fatalf("expected 1 tunnel for clientX, got %d", len(tunnels))
 	}
 }
 
@@ -353,3 +356,4 @@ func TestFullRelay(t *testing.T) {
 		t.Fatalf("expected 'hello from local service', got: %s", respStr)
 	}
 }
+
