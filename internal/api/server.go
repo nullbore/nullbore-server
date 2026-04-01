@@ -338,16 +338,30 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store.LogEvent(t.ID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
 	}
 
-	writeJSON(w, http.StatusCreated, t)
+	// Build response with public URL
+	resp := struct {
+		*tunnel.Tunnel
+		PublicURL string `json:"public_url"`
+	}{
+		Tunnel:    t,
+		PublicURL: s.publicURL(t.Slug),
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 	clientID := auth.ClientIDFrom(r.Context())
 	tunnels := s.cfg.Registry.List(clientID)
-	if tunnels == nil {
-		tunnels = []*tunnel.Tunnel{}
+
+	type tunnelWithURL struct {
+		*tunnel.Tunnel
+		PublicURL string `json:"public_url"`
 	}
-	writeJSON(w, http.StatusOK, tunnels)
+	result := make([]tunnelWithURL, 0, len(tunnels))
+	for _, t := range tunnels {
+		result = append(result, tunnelWithURL{Tunnel: t, PublicURL: s.publicURL(t.Slug)})
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
@@ -357,7 +371,11 @@ func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, t)
+	resp := struct {
+		*tunnel.Tunnel
+		PublicURL string `json:"public_url"`
+	}{Tunnel: t, PublicURL: s.publicURL(t.Slug)}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
@@ -633,6 +651,15 @@ func (s *Server) handleAdminCloseTunnel(w http.ResponseWriter, r *http.Request) 
 		s.cfg.Store.LogEvent(id, "closed", "closed via admin API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
+}
+
+// publicURL returns the public-facing URL for a tunnel slug.
+// Uses subdomain routing if base_domain is set, otherwise falls back to path-based.
+func (s *Server) publicURL(slug string) string {
+	if s.cfg.BaseDomain != "" {
+		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
+	}
+	return fmt.Sprintf("/t/%s", slug)
 }
 
 // --- Helpers ---
