@@ -35,6 +35,7 @@ type Config struct {
 	Auth        auth.Provider
 	Registry    *tunnel.Registry
 	Store       *store.Store
+	Events      *store.EventStore // separate event/request log DB (optional)
 	DashHandler http.Handler
 	BaseDomain  string // e.g. "tunnel.nullbore.com" — enables subdomain routing
 	AdminSecret string // shared secret for admin API (dashboard→server)
@@ -396,7 +397,9 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 			TTL: int64(ttl.Seconds()), Status: "active",
 			CreatedAt: t.CreatedAt, ExpiresAt: t.ExpiresAt,
 		})
-		s.cfg.Store.LogEvent(t.ID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
+	}
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogEvent(t.ID, t.ClientID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
 	}
 
 	// Build response with public URL
@@ -462,7 +465,9 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.Store != nil {
 		s.cfg.Store.CloseTunnel(id)
-		s.cfg.Store.LogEvent(id, "closed", "closed via API")
+	}
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogEvent(id, clientID, "closed", "closed via API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }
@@ -523,7 +528,7 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.cfg.Store == nil {
+	if s.cfg.Events == nil {
 		writeJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
@@ -535,7 +540,7 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logs, err := s.cfg.Store.ListRequests(id, limit)
+	logs, err := s.cfg.Events.ListRequests(id, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list requests"})
 		return
@@ -736,7 +741,9 @@ func (s *Server) handleAdminCloseTunnel(w http.ResponseWriter, r *http.Request) 
 	}
 	if s.cfg.Store != nil {
 		s.cfg.Store.CloseTunnel(id)
-		s.cfg.Store.LogEvent(id, "closed", "closed via admin API")
+	}
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogEvent(id, "", "closed", "closed via admin API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }
@@ -818,7 +825,9 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
 		remoteIP = strings.Split(fwd, ",")[0]
 	}
 
-	s.cfg.Store.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, remoteIP)
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, remoteIP)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

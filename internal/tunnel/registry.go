@@ -173,6 +173,15 @@ func (r *Registry) SetLimits(limits ConnectionLimit) {
 	r.limits = limits
 }
 
+// Restore loads a tunnel into the registry from persistent storage.
+// The tunnel starts without a WebSocket connection — the client must reconnect.
+func (r *Registry) Restore(t *Tunnel) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tunnels[t.ID] = t
+	r.slugs[t.Slug] = t.ID
+}
+
 // CountByClient returns the number of active tunnels for a client.
 func (r *Registry) CountByClient(clientID string) int {
 	r.mu.RLock()

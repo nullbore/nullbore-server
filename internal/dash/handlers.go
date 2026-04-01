@@ -11,12 +11,13 @@ import (
 // These are auth-agnostic — the caller wraps them with whatever
 // auth middleware is appropriate (passphrase, OAuth, etc.).
 type Handlers struct {
-	Store *store.Store
+	Store  *store.Store
+	Events *store.EventStore
 }
 
 // NewHandlers creates shared dashboard handlers.
-func NewHandlers(s *store.Store) *Handlers {
-	return &Handlers{Store: s}
+func NewHandlers(s *store.Store, events *store.EventStore) *Handlers {
+	return &Handlers{Store: s, Events: events}
 }
 
 // --- Tunnel handlers ---
@@ -42,14 +43,20 @@ func (h *Handlers) CloseTunnel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	h.Store.LogEvent(id, "closed", "closed via dashboard")
+	if h.Events != nil {
+		h.Events.LogEvent(id, "", "closed", "closed via dashboard")
+	}
 	writeJSON(w, 200, map[string]string{"status": "closed"})
 }
 
 // GetTunnelEvents returns events for a tunnel.
 func (h *Handlers) GetTunnelEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	events, err := h.Store.GetEvents(id, 50)
+	if h.Events == nil {
+		writeJSON(w, 200, []store.TunnelEvent{})
+		return
+	}
+	events, err := h.Events.GetEvents(id, 50)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

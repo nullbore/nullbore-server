@@ -39,7 +39,8 @@ var (
 
 // HostedConfig holds configuration for the hosted (commercial) dashboard.
 type HostedConfig struct {
-	Store *store.Store
+	Store  *store.Store
+	Events *store.EventStore
 	// TODO: Add when implementing hosted dashboard
 	// UserStore    *userstore.Store   // user accounts, sessions
 	// StripeKey    string             // Stripe API key
@@ -58,7 +59,7 @@ type HostedConfig struct {
 func HostedHandler(cfg HostedConfig) http.Handler {
 	mux := http.NewServeMux()
 	staticFS, _ := fs.Sub(staticFiles, "static")
-	handlers := NewHandlers(cfg.Store)
+	handlers := NewHandlers(cfg.Store, cfg.Events)
 
 	// TODO: Replace with OAuth/magic link session validation
 	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {

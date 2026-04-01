@@ -33,6 +33,7 @@ func main() {
 	apiKeys := flag.String("api-keys", envOr("NULLBORE_API_KEYS", ""), "Comma-separated API keys (dev mode)")
 	baseDomain := flag.String("base-domain", envOr("NULLBORE_BASE_DOMAIN", ""), "Base domain for subdomain routing (e.g. tunnel.nullbore.com)")
 	dbPath := flag.String("db", envOr("NULLBORE_DB", "nullbore.db"), "SQLite database path")
+	eventsDBPath := flag.String("events-db", envOr("NULLBORE_EVENTS_DB", "events.db"), "SQLite events database path")
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
 	webhookTarget := flag.String("webhook-target", envOr("NULLBORE_WEBHOOK_TARGET", ""), "Dashboard URL for event dispatch (e.g. https://nullbore.com)")
 	webhookSecret := flag.String("webhook-secret", envOr("NULLBORE_WEBHOOK_SECRET", ""), "Shared secret for internal event dispatch")
@@ -51,13 +52,20 @@ func main() {
 	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
 
-	// Initialize store
+	// Initialize stores
 	db, err := store.New(*dbPath)
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
 	defer db.Close()
 	slog.Info("database ready", "path", *dbPath)
+
+	events, err := store.NewEventStore(*eventsDBPath)
+	if err != nil {
+		log.Fatalf("events database error: %v", err)
+	}
+	defer events.Close()
+	slog.Info("events database ready", "path", *eventsDBPath)
 
 	// Initialize auth provider
 	// If webhook target (dashboard URL) is configured, use remote auth
@@ -87,6 +95,47 @@ func main() {
 	} else {
 		registry.SetLimits(tunnel.ConnectionLimit{MaxTunnels: 0})
 		slog.Info("connection limits", "max_tunnels", "unlimited")
+	}
+
+	// Restore active tunnels from DB (survive restarts)
+	if db != nil {
+		restored, err := db.LoadActiveTunnels()
+		if err != nil {
+			slog.Error("failed to load active tunnels", "error", err)
+		} else if len(restored) > 0 {
+			for _, rec := range restored {
+				t := &tunnel.Tunnel{
+					ID:        rec.ID,
+					Slug:      rec.Slug,
+					ClientID:  rec.ClientID,
+					LocalPort: rec.LocalPort,
+					Name:      rec.Name,
+					TTL:       tunnel.Duration(time.Duration(rec.TTL) * time.Second),
+					Mode:      "relay",
+					CreatedAt: rec.CreatedAt,
+					ExpiresAt: rec.ExpiresAt,
+					BytesIn:   rec.BytesIn,
+					BytesOut:  rec.BytesOut,
+					Requests:  rec.Requests,
+				}
+				registry.Restore(t)
+			}
+			slog.Info("restored tunnels from database", "count", len(restored))
+		}
+	}
+
+	// Periodic stats flush — save tunnel stats to DB every 30s
+	if db != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				tunnels := registry.List("")
+				for _, t := range tunnels {
+					db.FlushTunnelStats(t.ID, t.BytesIn, t.BytesOut, t.Requests, t.ExpiresAt)
+				}
+			}
+		}()
 	}
 
 	// Register event handler for webhook dispatch
@@ -121,12 +170,13 @@ func main() {
 	// Start TTL reaper
 	go registry.StartReaper()
 
-	// Prune old request logs every hour (keep 7 days)
-	if db != nil {
+	// Prune old events and request logs every hour (keep 90 days for events, 7 days for request logs)
+	if events != nil {
 		go func() {
 			for {
 				time.Sleep(1 * time.Hour)
-				db.PruneRequestLog(7 * 24 * time.Hour)
+				events.PruneRequestLog(7 * 24 * time.Hour)
+				events.PruneEvents(90 * 24 * time.Hour)
 			}
 		}()
 	}
@@ -165,6 +215,7 @@ func main() {
 		Auth:        authProvider,
 		Registry:    registry,
 		Store:       db,
+		Events:      events,
 		BaseDomain:  *baseDomain,
 		AdminSecret: adminSec,
 	}
@@ -178,6 +229,7 @@ func main() {
 		cfg.DashHandler = dash.EmbeddedHandler(dash.EmbeddedConfig{
 			Password: *dashPassword,
 			Store:    db,
+			Events:   events,
 		})
 		log.Printf("dashboard: enabled at /dash")
 	} else {

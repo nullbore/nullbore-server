@@ -211,6 +211,38 @@ func (s *Store) CloseTunnel(id string) error {
 	return err
 }
 
+// LoadActiveTunnels returns all tunnels that were active (not expired/closed) at shutdown.
+// Used on server restart to restore tunnels to the in-memory registry.
+func (s *Store) LoadActiveTunnels() ([]TunnelRecord, error) {
+	now := time.Now()
+	rows, err := s.db.Query(`
+		SELECT id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests
+		FROM tunnels WHERE status = 'active' AND expires_at > ?
+		ORDER BY created_at`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tunnels []TunnelRecord
+	for rows.Next() {
+		var t TunnelRecord
+		if err := rows.Scan(&t.ID, &t.Slug, &t.ClientID, &t.LocalPort, &t.Name, &t.TTL, &t.Status, &t.CreatedAt, &t.ExpiresAt, &t.ClosedAt, &t.BytesIn, &t.BytesOut, &t.Requests); err != nil {
+			return nil, err
+		}
+		tunnels = append(tunnels, t)
+	}
+	return tunnels, nil
+}
+
+// FlushTunnelStats batch-updates tunnel stats in the DB.
+func (s *Store) FlushTunnelStats(id string, bytesIn, bytesOut, requests int64, expiresAt time.Time) error {
+	_, err := s.db.Exec(
+		`UPDATE tunnels SET bytes_in = ?, bytes_out = ?, requests = ?, expires_at = ? WHERE id = ?`,
+		bytesIn, bytesOut, requests, expiresAt, id)
+	return err
+}
+
 func (s *Store) ExpireTunnels() (int64, error) {
 	now := time.Now()
 	result, err := s.db.Exec(`UPDATE tunnels SET status = 'expired', closed_at = ? WHERE status = 'active' AND expires_at < ?`, now, now)

@@ -18,6 +18,7 @@ var staticFiles embed.FS
 type EmbeddedConfig struct {
 	Password string
 	Store    *store.Store
+	Events   *store.EventStore
 }
 
 // EmbeddedHandler returns an HTTP handler for the self-hosted dashboard.
@@ -25,7 +26,7 @@ type EmbeddedConfig struct {
 func EmbeddedHandler(cfg EmbeddedConfig) http.Handler {
 	mux := http.NewServeMux()
 	staticFS, _ := fs.Sub(staticFiles, "static")
-	handlers := NewHandlers(cfg.Store)
+	handlers := NewHandlers(cfg.Store, cfg.Events)
 
 	// Passphrase auth middleware
 	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
