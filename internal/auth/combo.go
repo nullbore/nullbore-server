@@ -38,7 +38,20 @@ func (c *ComboProvider) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		clientID, ok := c.Validate(token)
+		// Pass device info to remote provider if available
+		deviceID := r.Header.Get("X-NullBore-Device-ID")
+		deviceHostname := r.Header.Get("X-NullBore-Device-Hostname")
+		deviceTakeover := r.Header.Get("X-NullBore-Device-Takeover") == "true"
+
+		var clientID string
+		var ok bool
+
+		if rp, isRemote := c.Primary.(*RemoteProvider); isRemote && (deviceID != "" || deviceHostname != "") {
+			clientID, ok = rp.ValidateWithDevice(token, deviceID, deviceHostname, deviceTakeover)
+		} else {
+			clientID, ok = c.Validate(token)
+		}
+
 		if !ok {
 			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
 			return
@@ -46,10 +59,14 @@ func (c *ComboProvider) Middleware(next http.Handler) http.Handler {
 
 		ctx := WithClientID(r.Context(), clientID)
 
-		// Try to get tier from remote provider
-		if rp, ok := c.Primary.(*RemoteProvider); ok {
+		// Set tier and device warning from remote provider cache
+		if rp, isRemote := c.Primary.(*RemoteProvider); isRemote {
 			if tier := rp.GetTier(token); tier != "" {
 				ctx = WithTier(ctx, tier)
+			}
+			// Inject device warning as response header so client can display it
+			if warning := rp.GetDeviceWarning(token); warning != "" {
+				w.Header().Set("X-NullBore-Device-Warning", warning)
 			}
 		}
 

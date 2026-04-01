@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -23,20 +24,26 @@ type RemoteProvider struct {
 }
 
 type cacheEntry struct {
-	clientID  string
-	userID    string
-	tier      string
-	validAt   time.Time
-	expiresAt time.Time
+	clientID      string
+	userID        string
+	tier          string
+	keyID         string
+	deviceWarning string
+	validAt       time.Time
+	expiresAt     time.Time
 }
 
 const cacheTTL = 5 * time.Minute
 
 type validateResponse struct {
-	Valid    bool   `json:"valid"`
-	ClientID string `json:"client_id"`
-	UserID   string `json:"user_id"`
-	Tier     string `json:"tier"`
+	Valid          bool   `json:"valid"`
+	ClientID       string `json:"client_id"`
+	UserID         string `json:"user_id"`
+	Tier           string `json:"tier"`
+	KeyID          string `json:"key_id"`
+	DeviceID       string `json:"device_id"`
+	DeviceHostname string `json:"device_hostname"`
+	DeviceWarning  string `json:"device_warning"`
 }
 
 func NewRemoteProvider(dashboardURL, secret string) *RemoteProvider {
@@ -49,6 +56,10 @@ func NewRemoteProvider(dashboardURL, secret string) *RemoteProvider {
 }
 
 func (p *RemoteProvider) Validate(token string) (string, bool) {
+	return p.ValidateWithDevice(token, "", "", false)
+}
+
+func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname string, takeover bool) (string, bool) {
 	// Check cache first
 	p.mu.RLock()
 	entry, ok := p.cache[token]
@@ -58,13 +69,21 @@ func (p *RemoteProvider) Validate(token string) (string, bool) {
 		return entry.clientID, true
 	}
 
+	// Build request body with device info
+	bodyData, _ := json.Marshal(map[string]interface{}{
+		"device_id":       deviceID,
+		"device_hostname": deviceHostname,
+		"takeover":        takeover,
+	})
+
 	// Call dashboard to validate
-	req, err := http.NewRequest("POST", p.dashboardURL+"/internal/validate-key", nil)
+	req, err := http.NewRequest("POST", p.dashboardURL+"/internal/validate-key", bytes.NewReader(bodyData))
 	if err != nil {
 		log.Printf("auth: remote validate error: %v", err)
 		return "", false
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
 	if p.secret != "" {
 		req.Header.Set("X-Internal-Secret", p.secret)
 	}
@@ -96,7 +115,6 @@ func (p *RemoteProvider) Validate(token string) (string, bool) {
 	}
 
 	// Use user_id as the client_id for multi-tenant isolation
-	// This ensures each user's tunnels have a unique client_id
 	clientID := result.UserID
 	if clientID == "" {
 		clientID = result.ClientID
@@ -105,15 +123,41 @@ func (p *RemoteProvider) Validate(token string) (string, bool) {
 	// Cache the result
 	p.mu.Lock()
 	p.cache[token] = &cacheEntry{
-		clientID:  clientID,
-		userID:    result.UserID,
-		tier:      result.Tier,
-		validAt:   time.Now(),
-		expiresAt: time.Now().Add(cacheTTL),
+		clientID:      clientID,
+		userID:        result.UserID,
+		tier:          result.Tier,
+		keyID:         result.KeyID,
+		deviceWarning: result.DeviceWarning,
+		validAt:       time.Now(),
+		expiresAt:     time.Now().Add(cacheTTL),
 	}
 	p.mu.Unlock()
 
+	if result.DeviceWarning != "" {
+		log.Printf("auth: device warning for key %s: %s", token[:12], result.DeviceWarning)
+	}
+
 	return clientID, true
+}
+
+// GetDeviceWarning returns any device warning for a cached token.
+func (p *RemoteProvider) GetDeviceWarning(token string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if entry, ok := p.cache[token]; ok {
+		return entry.deviceWarning
+	}
+	return ""
+}
+
+// GetKeyID returns the key ID for a cached token.
+func (p *RemoteProvider) GetKeyID(token string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if entry, ok := p.cache[token]; ok {
+		return entry.keyID
+	}
+	return ""
 }
 
 // GetTier returns the tier for a cached token. Returns empty string if not cached.
