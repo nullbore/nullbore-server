@@ -13,6 +13,11 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
+// DomainChecker checks if a domain is a registered custom domain.
+type DomainChecker interface {
+	Resolve(domain string) (slug string, userID string, err error)
+}
+
 // TLSConfig holds TLS-related settings.
 type TLSConfig struct {
 	// Manual cert/key paths
@@ -24,6 +29,9 @@ type TLSConfig struct {
 	CacheDir   string   // defaults to ~/.nullbore/certs
 	Email      string   // optional, for Let's Encrypt notifications
 	BaseDomain string   // if set, auto-cert {slug}.basedomain subdomains on demand
+
+	// Custom domain support — check if a domain is registered before issuing certs
+	DomainChecker DomainChecker
 }
 
 // IsEnabled returns true if any TLS mode is configured.
@@ -40,7 +48,7 @@ func (t *TLSConfig) IsACME() bool {
 // For ACME mode, also starts an HTTP-01 challenge listener on :80.
 func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 	if t.CertFile != "" && t.KeyFile != "" {
-		// Manual mode — just verify files exist
+		// Manual mode — verify files exist
 		if _, err := os.Stat(t.CertFile); err != nil {
 			return nil, fmt.Errorf("TLS cert not found: %s", t.CertFile)
 		}
@@ -51,6 +59,66 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("loading TLS cert: %w", err)
+		}
+
+		// If custom domain support is enabled, set up autocert for those
+		// while keeping the wildcard cert for NullBore subdomains
+		if t.DomainChecker != nil {
+			cacheDir := t.CacheDir
+			if cacheDir == "" {
+				home, _ := os.UserHomeDir()
+				if home == "" {
+					cacheDir = "/tmp/nullbore-certs"
+				} else {
+					cacheDir = filepath.Join(home, ".nullbore", "certs")
+				}
+			}
+			os.MkdirAll(cacheDir, 0700)
+
+			checker := t.DomainChecker
+			manager := &autocert.Manager{
+				Prompt: autocert.AcceptTOS,
+				Cache:  autocert.DirCache(cacheDir),
+				HostPolicy: func(ctx context.Context, host string) error {
+					// Only allow registered custom domains
+					_, _, err := checker.Resolve(host)
+					if err != nil {
+						return fmt.Errorf("host %q not a registered custom domain", host)
+					}
+					return nil
+				},
+			}
+			if t.Email != "" {
+				manager.Email = t.Email
+			}
+
+			log.Printf("tls: custom domain autocert enabled (cache: %s)", cacheDir)
+
+			// Start HTTP-01 challenge handler on :80
+			go func() {
+				h := manager.HTTPHandler(httpRedirectHandler())
+				log.Printf("tls: HTTP-01 challenge listener on :80")
+				if err := http.ListenAndServe(":80", h); err != nil {
+					log.Printf("tls: HTTP challenge listener error: %v", err)
+				}
+			}()
+
+			return &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					name := hello.ServerName
+
+					// Use wildcard cert for NullBore subdomains and the base domain
+					if t.BaseDomain != "" {
+						if name == t.BaseDomain || strings.HasSuffix(name, "."+t.BaseDomain) {
+							return &cert, nil
+						}
+					}
+
+					// Try autocert for custom domains
+					return manager.GetCertificate(hello)
+				},
+			}, nil
 		}
 
 		return &tls.Config{

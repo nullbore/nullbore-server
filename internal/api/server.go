@@ -29,16 +29,17 @@ var ServerVersion = "0.1.0-dev"
 const APIVersion = "1"
 
 type Config struct {
-	Host        string
-	Port        string
-	TLS         *TLSConfig
-	Auth        auth.Provider
-	Registry    *tunnel.Registry
-	Store       *store.Store
-	Events      *store.EventStore // separate event/request log DB (optional)
-	DashHandler http.Handler
-	BaseDomain  string // e.g. "tunnel.nullbore.com" — enables subdomain routing
-	AdminSecret string // shared secret for admin API (dashboard→server)
+	Host           string
+	Port           string
+	TLS            *TLSConfig
+	Auth           auth.Provider
+	Registry       *tunnel.Registry
+	Store          *store.Store
+	Events         *store.EventStore // separate event/request log DB (optional)
+	DashHandler    http.Handler
+	BaseDomain     string          // e.g. "tunnel.nullbore.com" — enables subdomain routing
+	AdminSecret    string          // shared secret for admin API (dashboard→server)
+	DomainResolver *DomainResolver // custom domain → tunnel slug resolver (optional)
 }
 
 // Server is the main HTTP server.
@@ -127,8 +128,15 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 		if strings.HasSuffix(host, suffix) && host != s.cfg.BaseDomain {
 			slug := strings.TrimSuffix(host, suffix)
 			if slug != "" && !strings.Contains(slug, ".") {
-				// Rewrite as a path-based request so handleProxy can process it
-				// Set PathValue via a sub-request to the /t/{slug} route
+				s.handleSubdomainProxy(w, r, slug)
+				return
+			}
+		}
+
+		// Check if this is a custom domain request
+		if s.cfg.DomainResolver != nil && host != s.cfg.BaseDomain && !strings.HasSuffix(host, suffix) {
+			slug, _, err := s.cfg.DomainResolver.Resolve(host)
+			if err == nil && slug != "" {
 				s.handleSubdomainProxy(w, r, slug)
 				return
 			}

@@ -192,32 +192,42 @@ func main() {
 		}
 	}
 
-	tlsCfg := &api.TLSConfig{
-		CertFile:   *tlsCert,
-		KeyFile:    *tlsKey,
-		Domains:    domains,
-		Email:      *tlsEmail,
-		CacheDir:   *tlsCacheDir,
-		BaseDomain: *baseDomain,
-	}
-
 	// Admin secret — default to webhook secret if not set separately
 	adminSec := *adminSecret
 	if adminSec == "" {
 		adminSec = *webhookSecret
 	}
 
+	// Custom domain resolver — queries dashboard for domain→slug mapping
+	var domainResolver *api.DomainResolver
+	if *webhookTarget != "" && *webhookSecret != "" {
+		domainResolver = api.NewDomainResolver(*webhookTarget, *webhookSecret)
+		domainResolver.StartCacheReaper()
+		slog.Info("custom domain resolver configured", "target", *webhookTarget)
+	}
+
+	tlsCfg := &api.TLSConfig{
+		CertFile:      *tlsCert,
+		KeyFile:       *tlsKey,
+		Domains:       domains,
+		Email:         *tlsEmail,
+		CacheDir:      *tlsCacheDir,
+		BaseDomain:    *baseDomain,
+		DomainChecker: domainResolver, // nil if no dashboard configured
+	}
+
 	// Build server config
 	cfg := api.Config{
-		Host:        *host,
-		Port:        *port,
-		TLS:         tlsCfg,
-		Auth:        authProvider,
-		Registry:    registry,
-		Store:       db,
-		Events:      events,
-		BaseDomain:  *baseDomain,
-		AdminSecret: adminSec,
+		Host:           *host,
+		Port:           *port,
+		TLS:            tlsCfg,
+		Auth:           authProvider,
+		Registry:       registry,
+		Store:          db,
+		Events:         events,
+		BaseDomain:     *baseDomain,
+		AdminSecret:    adminSec,
+		DomainResolver: domainResolver,
 	}
 
 	if *baseDomain != "" {
