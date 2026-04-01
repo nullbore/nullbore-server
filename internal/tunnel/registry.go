@@ -222,8 +222,26 @@ func (r *Registry) Create(clientID string, localPort int, name string, ttl time.
 
 	slug := generateSlug()
 	if name != "" {
-		// Check name uniqueness
-		if _, exists := r.slugs[name]; exists {
+		// Check if this name is already in use
+		if existingID, exists := r.slugs[name]; exists {
+			existing := r.tunnels[existingID]
+			// If same client owns it and no active connection, reclaim it
+			// (happens on reconnect after server restart)
+			if existing != nil && existing.ClientID == clientID {
+				existing.mu.Lock()
+				hasConn := existing.conn != nil && !existing.closed
+				existing.mu.Unlock()
+				if !hasConn {
+					// Reclaim: update TTL and port, return existing tunnel
+					now := time.Now()
+					existing.LocalPort = localPort
+					existing.TTL = Duration(ttl)
+					existing.ExpiresAt = now.Add(ttl)
+					log.Printf("tunnel reclaimed: id=%s slug=%s client=%s",
+						existing.ID, existing.Slug, clientID)
+					return existing, nil
+				}
+			}
 			return nil, fmt.Errorf("tunnel name %q already in use", name)
 		}
 		slug = name

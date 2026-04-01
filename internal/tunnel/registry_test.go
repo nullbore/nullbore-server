@@ -57,10 +57,22 @@ func TestCreateNamedTunnel(t *testing.T) {
 		t.Fatalf("expected slug 'myapp', got %s", tun.Slug)
 	}
 
-	// Duplicate name should fail
-	_, err = r.Create("client1", 9090, "myapp", 1*time.Hour)
+	// Same client, same name should reclaim (no active connection)
+	tun2, err := r.Create("client1", 9090, "myapp", 1*time.Hour)
+	if err != nil {
+		t.Fatalf("expected reclaim, got error: %v", err)
+	}
+	if tun2.ID != tun.ID {
+		t.Fatalf("expected same tunnel ID on reclaim, got %s vs %s", tun2.ID, tun.ID)
+	}
+	if tun2.LocalPort != 9090 {
+		t.Fatalf("expected port updated to 9090, got %d", tun2.LocalPort)
+	}
+
+	// Different client, same name should fail
+	_, err = r.Create("client2", 8080, "myapp", 1*time.Hour)
 	if err == nil {
-		t.Fatal("expected error for duplicate name")
+		t.Fatal("expected error for duplicate name from different client")
 	}
 }
 
@@ -412,5 +424,59 @@ func TestIsStaleUsesCreatedAtIfNeverPinged(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if !tun.IsStale(5 * time.Millisecond) {
 		t.Error("never-pinged tunnel should be stale after creation timeout")
+	}
+}
+
+func TestRestore(t *testing.T) {
+	r := NewRegistry()
+
+	now := time.Now()
+	restored := &Tunnel{
+		ID:        "restored-123",
+		Slug:      "my-service",
+		ClientID:  "user-1",
+		LocalPort: 3000,
+		Name:      "my-service",
+		TTL:       Duration(2 * time.Hour),
+		Mode:      "relay",
+		CreatedAt: now.Add(-30 * time.Minute),
+		ExpiresAt: now.Add(90 * time.Minute),
+		BytesIn:   1024,
+		BytesOut:  2048,
+		Requests:  5,
+	}
+
+	r.Restore(restored)
+
+	// Should be findable by ID
+	got, ok := r.Get("restored-123")
+	if !ok {
+		t.Fatal("restored tunnel not found by ID")
+	}
+	if got.Slug != "my-service" || got.BytesIn != 1024 {
+		t.Errorf("restored tunnel = %+v", got)
+	}
+
+	// Should be findable by slug
+	got2, ok := r.GetBySlug("my-service")
+	if !ok {
+		t.Fatal("restored tunnel not found by slug")
+	}
+	if got2.ID != "restored-123" {
+		t.Errorf("expected restored-123, got %s", got2.ID)
+	}
+
+	// Client should be able to reclaim it
+	reclaimed, err := r.Create("user-1", 3000, "my-service", 2*time.Hour)
+	if err != nil {
+		t.Fatalf("reclaim failed: %v", err)
+	}
+	if reclaimed.ID != "restored-123" {
+		t.Fatalf("expected same ID on reclaim")
+	}
+
+	// Should count in client's tunnel count
+	if r.CountByClient("user-1") != 1 {
+		t.Errorf("expected 1 tunnel for user-1, got %d", r.CountByClient("user-1"))
 	}
 }
