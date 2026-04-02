@@ -91,6 +91,7 @@ func (s *Server) routes() {
 	api.HandleFunc("POST /v1/tunnels", s.handleCreateTunnel)
 	api.HandleFunc("GET /v1/tunnels/{id}", s.handleGetTunnel)
 	api.HandleFunc("DELETE /v1/tunnels/{id}", s.handleCloseTunnel)
+	api.HandleFunc("POST /v1/tunnels/{id}/suspend", s.handleSuspendTunnel)
 	api.HandleFunc("POST /v1/tunnels/{id}/extend", s.handleExtendTunnel)
 	api.HandleFunc("GET /v1/tunnels/{id}/requests", s.handleListRequests)
 
@@ -100,6 +101,7 @@ func (s *Server) routes() {
 	admin := http.NewServeMux()
 	admin.HandleFunc("GET /v1/admin/tunnels", s.handleAdminListTunnels)
 	admin.HandleFunc("DELETE /v1/admin/tunnels/{id}", s.handleAdminCloseTunnel)
+	admin.HandleFunc("POST /v1/admin/tunnels/{id}/suspend", s.handleAdminSuspendTunnel)
 	s.mux.Handle("/v1/admin/", s.adminMiddleware(admin))
 
 	// Dashboard (if enabled)
@@ -151,6 +153,13 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 	t, ok := s.cfg.Registry.GetBySlug(slug)
 	if !ok {
 		http.Error(w, "tunnel not found", http.StatusNotFound)
+		return
+	}
+
+	if t.Suspended {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tunnel Suspended</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">⏸️</div><h1>Tunnel Suspended</h1><p>This tunnel has been temporarily suspended by its owner.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
 		return
 	}
 
@@ -480,6 +489,36 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
 }
 
+// handleSuspendTunnel toggles a tunnel's suspended state (user-facing, ownership checked).
+func (s *Server) handleSuspendTunnel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
+	t, ok := s.cfg.Registry.Get(id)
+	if !ok || t.ClientID != clientID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+
+	var req struct {
+		Suspended bool `json:"suspended"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := s.cfg.Registry.SetSuspended(id, req.Suspended); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	state := "resumed"
+	if req.Suspended {
+		state = "suspended"
+	}
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogEvent(id, clientID, state, "via API")
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": state, "suspended": fmt.Sprintf("%v", req.Suspended)})
+}
+
 type extendRequest struct {
 	TTL string `json:"ttl"`
 }
@@ -754,6 +793,28 @@ func (s *Server) handleAdminCloseTunnel(w http.ResponseWriter, r *http.Request) 
 		s.cfg.Events.LogEvent(id, "", "closed", "closed via admin API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "closed"})
+}
+
+// handleAdminSuspendTunnel toggles any tunnel's suspended state.
+func (s *Server) handleAdminSuspendTunnel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Suspended bool `json:"suspended"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := s.cfg.Registry.SetSuspended(id, req.Suspended); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	state := "resumed"
+	if req.Suspended {
+		state = "suspended"
+	}
+	if s.cfg.Events != nil {
+		s.cfg.Events.LogEvent(id, "", state, "via admin API")
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": state})
 }
 
 // publicURL returns the public-facing URL for a tunnel slug.

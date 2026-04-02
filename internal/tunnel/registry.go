@@ -30,6 +30,8 @@ type Tunnel struct {
 	IdleTTL    bool      `json:"idle_ttl,omitempty"`    // If true, TTL resets on activity
 	LastActive time.Time `json:"last_active,omitempty"` // Last time traffic was seen
 
+	Suspended bool `json:"suspended,omitempty"` // If true, proxy returns suspended page
+
 	// Internal — not serialized
 	conn            *websocket.Conn
 	mu              sync.Mutex
@@ -327,6 +329,26 @@ func (r *Registry) Close(id string) error {
 
 	log.Printf("tunnel closed: id=%s slug=%s", t.ID, t.Slug)
 	r.emit(Event{Type: EventClosed, Tunnel: t})
+	return nil
+}
+
+// SetSuspended toggles the suspended state of a tunnel.
+func (r *Registry) SetSuspended(id string, suspended bool) error {
+	r.mu.RLock()
+	t, ok := r.tunnels[id]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("tunnel %s not found", id)
+	}
+	t.mu.Lock()
+	t.Suspended = suspended
+	t.mu.Unlock()
+
+	state := "resumed"
+	if suspended {
+		state = "suspended"
+	}
+	log.Printf("tunnel %s: id=%s slug=%s", state, t.ID, t.Slug)
 	return nil
 }
 
