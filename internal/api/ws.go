@@ -101,6 +101,9 @@ func (h *WSHub) HandleControl(w http.ResponseWriter, r *http.Request) {
 	h.controls[tunnelID] = cc
 	h.controlsMu.Unlock()
 
+	// Store conn on the tunnel for connection status tracking
+	h.registry.SetConn(tunnelID, conn)
+
 	log.Printf("control connected: tunnel=%s client=%s", tunnelID, clientID)
 
 	// Keep the control connection alive with ping/pong
@@ -109,6 +112,8 @@ func (h *WSHub) HandleControl(w http.ResponseWriter, r *http.Request) {
 		h.controlsMu.Lock()
 		delete(h.controls, tunnelID)
 		h.controlsMu.Unlock()
+		// Clear conn on tunnel so status shows disconnected
+		h.registry.SetConn(tunnelID, nil)
 		log.Printf("control disconnected: tunnel=%s", tunnelID)
 	}()
 
