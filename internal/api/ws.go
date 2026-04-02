@@ -189,6 +189,16 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 	// This is the request the inbound client sent — the HTTP handler consumed it,
 	// so we reconstructed it and inject it into the pipe so the local service sees it.
 	dataConn := NewWSNetConn(wsConn)
+
+	// Look up tunnel for byte counting
+	var t *tunnel.Tunnel
+	if pc.tunnelID != "" {
+		t, _ = h.registry.Get(pc.tunnelID)
+	}
+
+	// Count the request prefix bytes (reconstructed HTTP request headers + body)
+	// These were already read during hijack and won't flow through the pipe
+	prefixBytes := int64(len(pc.reqPrefix))
 	if len(pc.reqPrefix) > 0 {
 		if _, err := dataConn.Write(pc.reqPrefix); err != nil {
 			log.Printf("data write prefix error: %v", err)
@@ -198,14 +208,8 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Look up tunnel for byte counting
-	var t *tunnel.Tunnel
-	if pc.tunnelID != "" {
-		t, _ = h.registry.Get(pc.tunnelID)
-	}
-
 	// Pipe bidirectionally: inbound conn ↔ data WebSocket (with byte counting)
-	pipeWithStats(pc.conn, dataConn, t)
+	pipeWithStats(pc.conn, dataConn, t, prefixBytes)
 }
 
 // sendConnection notifies the client over the control channel that a new connection needs handling.
@@ -293,11 +297,12 @@ func (c *countingReader) Count() int64 {
 // pipe copies data bidirectionally between two connections.
 // If a tunnel is provided, byte counts are recorded after relay completes.
 func pipe(a, b io.ReadWriteCloser) {
-	pipeWithStats(a, b, nil)
+	pipeWithStats(a, b, nil, 0)
 }
 
 // pipeWithStats copies data bidirectionally and reports byte counts to the tunnel.
-func pipeWithStats(a, b io.ReadWriteCloser, t *tunnel.Tunnel) {
+// extraIn accounts for bytes already sent (e.g., reconstructed request headers).
+func pipeWithStats(a, b io.ReadWriteCloser, t *tunnel.Tunnel, extraIn int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -320,8 +325,8 @@ func pipeWithStats(a, b io.ReadWriteCloser, t *tunnel.Tunnel) {
 	a.Close()
 	b.Close()
 
-	// Report final byte counts
+	// Report final byte counts (include pre-pipe request prefix in bytes_in)
 	if t != nil {
-		t.AddBytes(inCounter.Count(), outCounter.Count())
+		t.AddBytes(inCounter.Count()+extraIn, outCounter.Count())
 	}
 }
