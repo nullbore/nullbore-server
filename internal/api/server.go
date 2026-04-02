@@ -310,10 +310,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type createTunnelRequest struct {
-	LocalPort int    `json:"local_port"`
-	Name      string `json:"name,omitempty"`
-	TTL       string `json:"ttl,omitempty"`
-	IdleTTL   bool   `json:"idle_ttl,omitempty"` // If true, TTL resets on activity (idle timeout mode)
+	LocalPort  int    `json:"local_port"`
+	Name       string `json:"name,omitempty"`
+	TTL        string `json:"ttl,omitempty"`
+	IdleTTL    bool   `json:"idle_ttl,omitempty"`
+	DeviceName string `json:"device_name,omitempty"` // human-readable device name
+	Source     string `json:"source,omitempty"`      // "cli" or "daemon"
 }
 
 // tierMaxTTL returns the max TTL for a tier.
@@ -404,6 +406,16 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 
 	if req.IdleTTL {
 		t.IdleTTL = true
+	}
+
+	// Device identity — prefer request body, fall back to header
+	if req.DeviceName != "" {
+		t.DeviceName = req.DeviceName
+	} else if h := r.Header.Get("X-NullBore-Device-Hostname"); h != "" {
+		t.DeviceName = h
+	}
+	if req.Source != "" {
+		t.Source = req.Source
 	}
 
 	// Persist to store

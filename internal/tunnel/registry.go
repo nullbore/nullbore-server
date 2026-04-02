@@ -32,6 +32,9 @@ type Tunnel struct {
 
 	Suspended bool `json:"suspended,omitempty"` // If true, proxy returns suspended page
 
+	DeviceName string `json:"device_name,omitempty"` // hostname of the connecting device
+	Source     string `json:"source,omitempty"`       // "cli" or "daemon"
+
 	// Internal — not serialized
 	conn            *websocket.Conn
 	mu              sync.Mutex
