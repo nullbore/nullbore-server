@@ -414,6 +414,15 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		ttl = parsed
 	}
 
+	// TTL=0 means persistent (pro only)
+	if ttl == 0 {
+		if tier != "pro" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "persistent tunnels require Pro tier"})
+			return
+		}
+		ttl = 100 * 365 * 24 * time.Hour // ~100 years
+	}
+
 	// Enforce tier-based TTL cap (0 = no limit for pro)
 	if maxTTL := tierMaxTTL(tier); maxTTL > 0 && ttl > maxTTL {
 		ttl = maxTTL
