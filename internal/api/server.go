@@ -28,6 +28,11 @@ var ServerVersion = "0.1.0-dev"
 // APIVersion is the API protocol version. Bump on breaking changes.
 const APIVersion = "1"
 
+// IPCheckerProvider is implemented by RemoteProvider to check IP allowlists.
+type IPCheckerProvider interface {
+	GetIPAllowlistForUser(userID string) []string
+}
+
 type Config struct {
 	Host           string
 	Port           string
@@ -37,9 +42,10 @@ type Config struct {
 	Store          *store.Store
 	Events         *store.EventStore // separate event/request log DB (optional)
 	DashHandler    http.Handler
-	BaseDomain     string          // e.g. "tunnel.nullbore.com" — enables subdomain routing
-	AdminSecret    string          // shared secret for admin API (dashboard→server)
-	DomainResolver *DomainResolver // custom domain → tunnel slug resolver (optional)
+	BaseDomain     string              // e.g. "tunnel.nullbore.com" — enables subdomain routing
+	AdminSecret    string              // shared secret for admin API (dashboard→server)
+	DomainResolver *DomainResolver     // custom domain → tunnel slug resolver (optional)
+	IPChecker      IPCheckerProvider   // optional; nil means allow all IPs
 }
 
 // Server is the main HTTP server.
@@ -166,6 +172,21 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 	if time.Now().After(t.ExpiresAt) {
 		http.Error(w, "tunnel expired", http.StatusGone)
 		return
+	}
+
+	// IP allowlist check
+	if s.cfg.IPChecker != nil {
+		clientIP := r.RemoteAddr
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			clientIP = strings.TrimSpace(strings.Split(fwd, ",")[0])
+		}
+		allowlist := s.cfg.IPChecker.GetIPAllowlistForUser(t.ClientID)
+		if !checkIPAllowed(clientIP, allowlist) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
+			return
+		}
 	}
 
 	// Reconstruct HTTP request — for subdomain proxy, the full path stays as-is
@@ -625,6 +646,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// IP allowlist check
+	if s.cfg.IPChecker != nil {
+		clientIP := r.RemoteAddr
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			clientIP = strings.TrimSpace(strings.Split(fwd, ",")[0])
+		}
+		allowlist := s.cfg.IPChecker.GetIPAllowlistForUser(t.ClientID)
+		if !checkIPAllowed(clientIP, allowlist) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
+			return
+		}
+	}
+
 	// Reconstruct the HTTP request as raw bytes.
 	// The HTTP server has already consumed the request, so we need to rebuild it
 	// so the local service on the client side receives a proper HTTP request.
@@ -917,4 +953,31 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("json encode error: %v", err)
 	}
+}
+
+// checkIPAllowed checks if the given remote address is permitted by the CIDR allowlist.
+// If the allowlist is empty, all IPs are allowed.
+// remoteAddr can be "IP:port" or just "IP".
+func checkIPAllowed(remoteAddr string, cidrs []string) bool {
+	if len(cidrs) == 0 {
+		return true
+	}
+	ip := remoteAddr
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		ip = host
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }

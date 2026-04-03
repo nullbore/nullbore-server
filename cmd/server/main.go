@@ -72,14 +72,15 @@ func main() {
 	// which validates keys against the dashboard DB. Static keys are
 	// kept as a fallback for self-hosted/dev mode.
 	var authProvider auth.Provider
+	var remoteProvider *auth.RemoteProvider
 	if *webhookTarget != "" && *webhookSecret != "" {
-		remote := auth.NewRemoteProvider(*webhookTarget, *webhookSecret)
-		remote.StartCacheReaper()
+		remoteProvider = auth.NewRemoteProvider(*webhookTarget, *webhookSecret)
+		remoteProvider.StartCacheReaper()
 		slog.Info("auth: remote validation", "target", *webhookTarget)
 
 		// Use a combo provider: try remote first, fall back to static
 		authProvider = &auth.ComboProvider{
-			Primary:  remote,
+			Primary:  remoteProvider,
 			Fallback: auth.NewStaticProvider(*apiKeys),
 		}
 	} else {
@@ -228,6 +229,7 @@ func main() {
 		BaseDomain:     *baseDomain,
 		AdminSecret:    adminSec,
 		DomainResolver: domainResolver,
+		IPChecker:      remoteProvider, // nil if no remote auth configured
 	}
 
 	if *baseDomain != "" {

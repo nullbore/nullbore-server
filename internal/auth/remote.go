@@ -29,6 +29,7 @@ type cacheEntry struct {
 	tier          string
 	keyID         string
 	deviceWarning string
+	ipAllowlist   []string // CIDRs for IP allowlisting
 	validAt       time.Time
 	expiresAt     time.Time
 }
@@ -36,14 +37,15 @@ type cacheEntry struct {
 const cacheTTL = 5 * time.Minute
 
 type validateResponse struct {
-	Valid          bool   `json:"valid"`
-	ClientID       string `json:"client_id"`
-	UserID         string `json:"user_id"`
-	Tier           string `json:"tier"`
-	KeyID          string `json:"key_id"`
-	DeviceID       string `json:"device_id"`
-	DeviceHostname string `json:"device_hostname"`
-	DeviceWarning  string `json:"device_warning"`
+	Valid          bool     `json:"valid"`
+	ClientID       string   `json:"client_id"`
+	UserID         string   `json:"user_id"`
+	Tier           string   `json:"tier"`
+	KeyID          string   `json:"key_id"`
+	DeviceID       string   `json:"device_id"`
+	DeviceHostname string   `json:"device_hostname"`
+	DeviceWarning  string   `json:"device_warning"`
+	IPAllowlist    []string `json:"ip_allowlist"`
 }
 
 func NewRemoteProvider(dashboardURL, secret string) *RemoteProvider {
@@ -128,6 +130,7 @@ func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname stri
 		tier:          result.Tier,
 		keyID:         result.KeyID,
 		deviceWarning: result.DeviceWarning,
+		ipAllowlist:   result.IPAllowlist,
 		validAt:       time.Now(),
 		expiresAt:     time.Now().Add(cacheTTL),
 	}
@@ -214,6 +217,19 @@ func (p *RemoteProvider) StartCacheReaper() {
 			p.mu.Unlock()
 		}
 	}()
+}
+
+// GetIPAllowlistForUser returns the cached IP allowlist CIDRs for a given user ID.
+// Returns nil if not cached or no allowlist set.
+func (p *RemoteProvider) GetIPAllowlistForUser(userID string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, entry := range p.cache {
+		if entry.userID == userID {
+			return entry.ipAllowlist
+		}
+	}
+	return nil
 }
 
 func (p *RemoteProvider) String() string {
