@@ -24,14 +24,16 @@ type RemoteProvider struct {
 }
 
 type cacheEntry struct {
-	clientID      string
-	userID        string
-	tier          string
-	keyID         string
-	deviceWarning string
-	ipAllowlist   []string // CIDRs for IP allowlisting
-	validAt       time.Time
-	expiresAt     time.Time
+	clientID       string
+	userID         string
+	tier           string
+	keyID          string
+	deviceWarning  string
+	ipAllowlist    []string // CIDRs for IP allowlisting
+	bandwidthUsed  int64
+	bandwidthLimit int64
+	validAt        time.Time
+	expiresAt      time.Time
 }
 
 const cacheTTL = 5 * time.Minute
@@ -46,6 +48,8 @@ type validateResponse struct {
 	DeviceHostname string   `json:"device_hostname"`
 	DeviceWarning  string   `json:"device_warning"`
 	IPAllowlist    []string `json:"ip_allowlist"`
+	BandwidthUsed  int64    `json:"bandwidth_used"`
+	BandwidthLimit int64    `json:"bandwidth_limit"`
 }
 
 func NewRemoteProvider(dashboardURL, secret string) *RemoteProvider {
@@ -125,14 +129,16 @@ func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname stri
 	// Cache the result
 	p.mu.Lock()
 	p.cache[token] = &cacheEntry{
-		clientID:      clientID,
-		userID:        result.UserID,
-		tier:          result.Tier,
-		keyID:         result.KeyID,
-		deviceWarning: result.DeviceWarning,
-		ipAllowlist:   result.IPAllowlist,
-		validAt:       time.Now(),
-		expiresAt:     time.Now().Add(cacheTTL),
+		clientID:       clientID,
+		userID:         result.UserID,
+		tier:           result.Tier,
+		keyID:          result.KeyID,
+		deviceWarning:  result.DeviceWarning,
+		ipAllowlist:    result.IPAllowlist,
+		bandwidthUsed:  result.BandwidthUsed,
+		bandwidthLimit: result.BandwidthLimit,
+		validAt:        time.Now(),
+		expiresAt:      time.Now().Add(cacheTTL),
 	}
 	p.mu.Unlock()
 
@@ -171,6 +177,16 @@ func (p *RemoteProvider) GetTier(token string) string {
 		return entry.tier
 	}
 	return ""
+}
+
+// GetBandwidthInfo returns (used, limit) for a cached token.
+func (p *RemoteProvider) GetBandwidthInfo(token string) (int64, int64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.cache[token]; ok {
+		return e.bandwidthUsed, e.bandwidthLimit
+	}
+	return 0, 0
 }
 
 func (p *RemoteProvider) Middleware(next http.Handler) http.Handler {

@@ -428,6 +428,18 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		ttl = maxTTL
 	}
 
+	// Bandwidth limit check
+	if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		used, limit := rp.GetBandwidthInfo(token)
+		if limit > 0 && used >= limit {
+			writeJSON(w, http.StatusPaymentRequired, map[string]string{
+				"error": "monthly bandwidth limit exceeded — upgrade your plan or wait until next month",
+			})
+			return
+		}
+	}
+
 	t, err := s.cfg.Registry.Create(clientID, req.LocalPort, req.Name, ttl)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
