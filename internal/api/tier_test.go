@@ -15,8 +15,8 @@ func TestTierTunnelLimit(t *testing.T) {
 		expected int
 	}{
 		{"free", 1},
-		{"hobby", 3},
-		{"pro", 10},
+		{"hobby", 5},
+		{"pro", 20},
 		{"", 1},
 	}
 	for _, tt := range tests {
