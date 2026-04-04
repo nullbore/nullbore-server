@@ -217,19 +217,28 @@ func main() {
 		DomainChecker: domainResolver, // nil if no dashboard configured
 	}
 
+	// Account subdomain resolver — queries dashboard for subdomain→user mapping
+	var subdomainResolver *api.SubdomainResolver
+	if *webhookTarget != "" && *webhookSecret != "" {
+		subdomainResolver = api.NewSubdomainResolver(*webhookTarget, *webhookSecret)
+		subdomainResolver.StartCacheReaper()
+		slog.Info("account subdomain resolver configured")
+	}
+
 	// Build server config
 	cfg := api.Config{
-		Host:           *host,
-		Port:           *port,
-		TLS:            tlsCfg,
-		Auth:           authProvider,
-		Registry:       registry,
-		Store:          db,
-		Events:         events,
-		BaseDomain:     *baseDomain,
-		AdminSecret:    adminSec,
-		DomainResolver: domainResolver,
-		IPChecker:      remoteProvider, // nil if no remote auth configured
+		Host:              *host,
+		Port:              *port,
+		TLS:               tlsCfg,
+		Auth:              authProvider,
+		Registry:          registry,
+		Store:             db,
+		Events:            events,
+		BaseDomain:        *baseDomain,
+		AdminSecret:       adminSec,
+		DomainResolver:    domainResolver,
+		SubdomainResolver: subdomainResolver,
+		IPChecker:         remoteProvider, // nil if no remote auth configured
 	}
 
 	if *baseDomain != "" {

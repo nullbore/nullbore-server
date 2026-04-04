@@ -44,8 +44,9 @@ type Config struct {
 	DashHandler    http.Handler
 	BaseDomain     string              // e.g. "tunnel.nullbore.com" — enables subdomain routing
 	AdminSecret    string              // shared secret for admin API (dashboard→server)
-	DomainResolver *DomainResolver     // custom domain → tunnel slug resolver (optional)
-	IPChecker      IPCheckerProvider   // optional; nil means allow all IPs
+	DomainResolver    *DomainResolver    // custom domain → tunnel slug resolver (optional)
+	SubdomainResolver *SubdomainResolver // account subdomain → user ID resolver (optional)
+	IPChecker         IPCheckerProvider  // optional; nil means allow all IPs
 }
 
 // Server is the main HTTP server.
@@ -157,6 +158,24 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 // handleSubdomainProxy handles proxying for subdomain-based tunnel requests.
 func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, slug string) {
 	t, ok := s.cfg.Registry.GetBySlug(slug)
+
+	// If no direct tunnel match, try account subdomain resolution
+	if !ok && s.cfg.SubdomainResolver != nil {
+		userID, err := s.cfg.SubdomainResolver.Resolve(slug)
+		if err == nil && userID != "" {
+			// Find the user's active tunnels and route to the most recent
+			tunnels := s.cfg.Registry.GetByClient(userID)
+			if len(tunnels) > 0 {
+				t = tunnels[0]
+				ok = true
+			} else {
+				// User has a subdomain but no active tunnels
+				s.renderOfflinePage(w, slug)
+				return
+			}
+		}
+	}
+
 	if !ok {
 		http.Error(w, "tunnel not found", http.StatusNotFound)
 		return
@@ -437,6 +456,16 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 				"error": "monthly bandwidth limit exceeded — upgrade your plan or wait until next month",
 			})
 			return
+		}
+	}
+
+	// If no explicit name given and user has a claimed subdomain, try using it
+	if req.Name == "" {
+		if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
+			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if sub := rp.GetSubdomain(token); sub != "" {
+				req.Name = sub
+			}
 		}
 	}
 
@@ -966,6 +995,13 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
 	if s.cfg.Events != nil {
 		s.cfg.Events.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, remoteIP)
 	}
+}
+
+// renderOfflinePage shows a branded "tunnel offline" page for account subdomains with no active tunnels.
+func (s *Server) renderOfflinePage(w http.ResponseWriter, subdomain string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s — Offline</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:420px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}.sub{color:#6366f1;font-family:monospace;font-size:1rem}a{color:#6366f1}</style></head><body><div><div class="icon">🌙</div><h1>Tunnel Offline</h1><p class="sub">%s.tunnel.nullbore.com</p><p style="margin-top:1rem;">This endpoint is registered but has no active tunnels right now.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`, subdomain, subdomain)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

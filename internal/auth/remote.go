@@ -32,6 +32,7 @@ type cacheEntry struct {
 	ipAllowlist    []string // CIDRs for IP allowlisting
 	bandwidthUsed  int64
 	bandwidthLimit int64
+	subdomain      string // account subdomain (empty if none)
 	validAt        time.Time
 	expiresAt      time.Time
 }
@@ -50,6 +51,7 @@ type validateResponse struct {
 	IPAllowlist    []string `json:"ip_allowlist"`
 	BandwidthUsed  int64    `json:"bandwidth_used"`
 	BandwidthLimit int64    `json:"bandwidth_limit"`
+	Subdomain      string   `json:"subdomain"`
 }
 
 func NewRemoteProvider(dashboardURL, secret string) *RemoteProvider {
@@ -137,6 +139,7 @@ func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname stri
 		ipAllowlist:    result.IPAllowlist,
 		bandwidthUsed:  result.BandwidthUsed,
 		bandwidthLimit: result.BandwidthLimit,
+		subdomain:      result.Subdomain,
 		validAt:        time.Now(),
 		expiresAt:      time.Now().Add(cacheTTL),
 	}
@@ -187,6 +190,16 @@ func (p *RemoteProvider) GetBandwidthInfo(token string) (int64, int64) {
 		return e.bandwidthUsed, e.bandwidthLimit
 	}
 	return 0, 0
+}
+
+// GetSubdomain returns the account subdomain for a cached token (empty if none).
+func (p *RemoteProvider) GetSubdomain(token string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.cache[token]; ok {
+		return e.subdomain
+	}
+	return ""
 }
 
 func (p *RemoteProvider) Middleware(next http.Handler) http.Handler {

@@ -200,6 +200,19 @@ func (r *Registry) CountByClient(clientID string) int {
 	return count
 }
 
+// GetByClient returns all active tunnels for a client, sorted newest first.
+func (r *Registry) GetByClient(clientID string) []*Tunnel {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []*Tunnel
+	for _, t := range r.tunnels {
+		if t.ClientID == clientID && !t.Suspended && time.Now().Before(t.ExpiresAt) {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
 // Create registers a new tunnel and returns it.
 func (r *Registry) Create(clientID string, localPort int, name string, ttl time.Duration) (*Tunnel, error) {
 	r.mu.Lock()
