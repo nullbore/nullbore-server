@@ -531,11 +531,35 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate tunnel name
+	// Validate tunnel name — only allowed if user owns an account subdomain or custom domain
 	if req.Name != "" {
 		if err := validateTunnelName(req.Name); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+
+		// Allow reclaiming an existing tunnel by slug (reconnect after restart)
+		isReclaim := false
+		if existing, ok := s.cfg.Registry.GetBySlug(req.Name); ok && existing.ClientID == clientID {
+			isReclaim = true
+		}
+
+		if !isReclaim {
+			// Named tunnels require an account subdomain (Hobby+) or custom domain (Pro).
+			// Without one, names would collide in the global tunnel.nullbore.com namespace.
+			hasNamespace := false
+			if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
+				token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				if sub := rp.GetSubdomain(token); sub != "" {
+					hasNamespace = true
+				}
+			}
+			if !hasNamespace {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "named tunnels require an account subdomain — claim one in your dashboard (Hobby plan and up)",
+				})
+				return
+			}
 		}
 	}
 
