@@ -461,6 +461,32 @@ func randomBytes(n int) []byte {
 	return b
 }
 
+// ClientBandwidth holds aggregate bytes for a single client.
+type ClientBandwidth struct {
+	BytesIn  int64
+	BytesOut int64
+}
+
+// BandwidthByClient returns aggregate bytes_in/bytes_out per client_id across all tunnels.
+func (s *Store) BandwidthByClient() (map[string]ClientBandwidth, error) {
+	rows, err := s.db.Query(`SELECT client_id, COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM tunnels GROUP BY client_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]ClientBandwidth)
+	for rows.Next() {
+		var clientID string
+		var bw ClientBandwidth
+		if err := rows.Scan(&clientID, &bw.BytesIn, &bw.BytesOut); err != nil {
+			continue
+		}
+		result[clientID] = bw
+	}
+	return result, nil
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }

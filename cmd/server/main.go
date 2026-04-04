@@ -267,6 +267,12 @@ func main() {
 	// Build and start server
 	srv := api.NewServer(cfg)
 
+	// Bandwidth reporter — flush per-client stats to dashboard every 30s
+	if *webhookTarget != "" && *webhookSecret != "" {
+		bwReporter := api.NewBandwidthReporter(db, *webhookTarget, *webhookSecret, 30*time.Second)
+		bwReporter.Start()
+	}
+
 	// Graceful shutdown on SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
