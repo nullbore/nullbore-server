@@ -40,6 +40,7 @@ func main() {
 	webhookSecret := flag.String("webhook-secret", envOr("NULLBORE_WEBHOOK_SECRET", ""), "Shared secret for internal event dispatch")
 	adminSecret := flag.String("admin-secret", envOr("NULLBORE_ADMIN_SECRET", ""), "Shared secret for admin API (dashboard→server)")
 	maxTunnels := flag.Int("max-tunnels", envOrInt("NULLBORE_MAX_TUNNELS", 10), "Max tunnels per client (0 = unlimited)")
+	maxBodyMB := flag.Int("max-body-mb", envOrInt("NULLBORE_MAX_BODY_MB", 500), "Max request body size in MB (0 = unlimited)")
 	flag.Parse()
 
 	// Set up structured logging
@@ -241,6 +242,7 @@ func main() {
 		DomainResolver:    domainResolver,
 		SubdomainResolver: subdomainResolver,
 		IPChecker:         remoteProvider, // nil if no remote auth configured
+		MaxBodyBytes:      int64(*maxBodyMB) * 1024 * 1024,
 	}
 
 	if *baseDomain != "" {

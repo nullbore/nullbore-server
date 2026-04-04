@@ -48,6 +48,7 @@ type Config struct {
 	DomainResolver    *DomainResolver    // custom domain → tunnel slug resolver (optional)
 	SubdomainResolver *SubdomainResolver // account subdomain → user ID resolver (optional)
 	IPChecker         IPCheckerProvider  // optional; nil means allow all IPs
+	MaxBodyBytes      int64              // max request body size (0 = unlimited, default 500MB)
 }
 
 // Server is the main HTTP server.
@@ -233,7 +234,11 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 
 	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
+		if s.cfg.MaxBodyBytes > 0 {
+			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBytes))
+		} else {
+			bodyBytes, _ = io.ReadAll(r.Body)
+		}
 	}
 	reqPrefix := append(reqBytes, bodyBytes...)
 
@@ -774,11 +779,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// so the local service on the client side receives a proper HTTP request.
 	reqBytes := reconstructHTTPRequest(r)
 
-	// Read request body (if any) — no size cap, the body must flow through
-	// to the tunnel client (file uploads, etc.)
+	// Read request body — capped by MaxBodyBytes to prevent OOM (default 500MB, 0 = unlimited)
 	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
+		if s.cfg.MaxBodyBytes > 0 {
+			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBytes))
+		} else {
+			bodyBytes, _ = io.ReadAll(r.Body)
+		}
 	}
 
 	reqPrefix := append(reqBytes, bodyBytes...)
