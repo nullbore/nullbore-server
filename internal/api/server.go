@@ -57,7 +57,9 @@ type Server struct {
 	mux         *http.ServeMux
 	wsHub       *WSHub
 	rateLimiter *RateLimiter
-	httpServer  *http.Server
+	// Per-tunnel request rate limiters, keyed by tier
+	proxyLimiters map[string]*RateLimiter
+	httpServer    *http.Server
 }
 
 func NewServer(cfg Config) *Server {
@@ -67,6 +69,12 @@ func NewServer(cfg Config) *Server {
 		wsHub: NewWSHub(cfg.Registry),
 		// Rate limit: 10 tunnel creations per minute per client, burst of 5
 		rateLimiter: NewRateLimiter(10, time.Minute, 5),
+		// Per-tunnel proxy rate limiters by tier
+		proxyLimiters: map[string]*RateLimiter{
+			"free":  NewRateLimiter(60, time.Minute, 20),   // 1 req/s, burst 20
+			"hobby": NewRateLimiter(300, time.Minute, 60),  // 5 req/s, burst 60
+			"pro":   NewRateLimiter(600, time.Minute, 100), // 10 req/s, burst 100
+		},
 	}
 	s.routes()
 	return s
@@ -227,6 +235,11 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
 			return
 		}
+	}
+
+	// Per-tunnel request rate limit
+	if !s.checkProxyRateLimit(w, t) {
+		return
 	}
 
 	// Reconstruct HTTP request — for subdomain proxy, the full path stays as-is
@@ -440,6 +453,24 @@ func tierMaxTTL(tier string) time.Duration {
 	default: // free
 		return 2 * time.Hour
 	}
+}
+
+// checkProxyRateLimit returns true if the request is allowed through.
+func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bool {
+	tier := t.Tier
+	if tier == "" {
+		tier = "free"
+	}
+	limiter, ok := s.proxyLimiters[tier]
+	if !ok {
+		limiter = s.proxyLimiters["free"]
+	}
+	if !limiter.Allow(t.ID) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "429 Too Many Requests — tunnel rate limit exceeded", http.StatusTooManyRequests)
+		return false
+	}
+	return true
 }
 
 // tierMaxBodyBytes returns the max request body size for a tier.
@@ -789,6 +820,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
 			return
 		}
+	}
+
+	// Per-tunnel request rate limit
+	if !s.checkProxyRateLimit(w, t) {
+		return
 	}
 
 	// Reconstruct the HTTP request as raw bytes.
