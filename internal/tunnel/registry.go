@@ -328,6 +328,12 @@ func (r *Registry) List(clientID string) []*Tunnel {
 
 // Close shuts down a tunnel.
 func (r *Registry) Close(id string) error {
+	return r.CloseWithReason(id, 0, "")
+}
+
+// CloseWithReason closes a tunnel, optionally sending a WebSocket close frame
+// with a specific code and reason text. Use closeCode=0 for a raw close.
+func (r *Registry) CloseWithReason(id string, closeCode int, reason string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -338,6 +344,11 @@ func (r *Registry) Close(id string) error {
 
 	t.mu.Lock()
 	if t.conn != nil && !t.closed {
+		if closeCode > 0 {
+			// Send close frame with reason so client can distinguish TTL expiry from network errors
+			msg := websocket.FormatCloseMessage(closeCode, reason)
+			t.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(5*time.Second))
+		}
 		t.conn.Close()
 	}
 	t.closed = true
@@ -467,7 +478,7 @@ func (r *Registry) reapExpired() {
 
 	for _, id := range expired {
 		log.Printf("reaping expired tunnel: %s", id)
-		r.Close(id)
+		r.CloseWithReason(id, websocket.CloseNormalClosure, "tunnel TTL expired")
 	}
 
 	for _, id := range stale {
