@@ -27,6 +27,24 @@ func TestTierTunnelLimit(t *testing.T) {
 	}
 }
 
+func TestTierMaxBodyBytes(t *testing.T) {
+	tests := []struct {
+		tier     string
+		expected int64
+	}{
+		{"free", 25 * 1024 * 1024},
+		{"hobby", 100 * 1024 * 1024},
+		{"pro", 500 * 1024 * 1024},
+		{"", 25 * 1024 * 1024},
+	}
+	for _, tt := range tests {
+		got := tierMaxBodyBytes(tt.tier)
+		if got != tt.expected {
+			t.Errorf("tierMaxBodyBytes(%q) = %d, want %d", tt.tier, got, tt.expected)
+		}
+	}
+}
+
 func TestTierMaxTTL(t *testing.T) {
 	tests := []struct {
 		tier     string

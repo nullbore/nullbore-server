@@ -1,11 +1,13 @@
 package api
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,7 +48,16 @@ type WSHub struct {
 	// Pending inbound connections waiting for a client data WS
 	pending   map[string]*pendingConn
 	pendingMu sync.Mutex
+
+	// Active relay counter for backpressure
+	activeRelays int64
 }
+
+const (
+	maxPendingPerTunnel = 50  // max queued connections per tunnel before rejecting
+	maxActiveRelays     = 500 // global max concurrent relays (goroutine pairs)
+	relayTimeout        = 10 * time.Minute // max relay duration (kill stalled pipes)
+)
 
 // pendingConn holds a hijacked connection plus the reconstructed HTTP request.
 type pendingConn struct {
@@ -208,8 +219,33 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Global relay cap — reject if too many concurrent relays
+	active := atomic.AddInt64(&h.activeRelays, 1)
+	if active > maxActiveRelays {
+		atomic.AddInt64(&h.activeRelays, -1)
+		log.Printf("relay rejected: global limit reached (%d)", maxActiveRelays)
+		pc.conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nserver at capacity\n"))
+		pc.conn.Close()
+		dataConn.Close()
+		return
+	}
+
+	// Relay with timeout — kill stalled pipes after relayTimeout
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(relayTimeout):
+			log.Printf("relay timeout: id=%s (after %v)", connID, relayTimeout)
+			pc.conn.Close()
+			dataConn.Close()
+		}
+	}()
+
 	// Pipe bidirectionally: inbound conn ↔ data WebSocket (with byte counting)
 	pipeWithStats(pc.conn, dataConn, t, prefixBytes)
+	close(done)
+	atomic.AddInt64(&h.activeRelays, -1)
 }
 
 // sendConnection notifies the client over the control channel that a new connection needs handling.
@@ -235,6 +271,21 @@ func (h *WSHub) sendConnection(tunnelID string, connID string) error {
 // RelayConn handles an inbound connection to a tunnel.
 // reqPrefix is the reconstructed HTTP request bytes (since the handler already consumed them).
 func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) error {
+	// Check pending queue depth for this tunnel (prevent flood)
+	h.pendingMu.Lock()
+	pendingCount := 0
+	for _, pc := range h.pending {
+		if pc.tunnelID == tunnelID {
+			pendingCount++
+		}
+	}
+	if pendingCount >= maxPendingPerTunnel {
+		h.pendingMu.Unlock()
+		inbound.Close()
+		return fmt.Errorf("tunnel %s: pending connection limit reached (%d)", tunnelID, maxPendingPerTunnel)
+	}
+	h.pendingMu.Unlock()
+
 	connID := uuid.New().String()
 
 	pc := &pendingConn{

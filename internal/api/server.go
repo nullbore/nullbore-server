@@ -232,13 +232,14 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 	// Reconstruct HTTP request — for subdomain proxy, the full path stays as-is
 	reqBytes := reconstructSubdomainRequest(r, slug)
 
+	// Tier-based body limit (falls back to global MaxBodyBytes config)
+	bodyLimit := tierMaxBodyBytes(t.Tier)
+	if s.cfg.MaxBodyBytes > 0 && s.cfg.MaxBodyBytes < bodyLimit {
+		bodyLimit = s.cfg.MaxBodyBytes
+	}
 	var bodyBytes []byte
 	if r.Body != nil {
-		if s.cfg.MaxBodyBytes > 0 {
-			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBytes))
-		} else {
-			bodyBytes, _ = io.ReadAll(r.Body)
-		}
+		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	}
 	reqPrefix := append(reqBytes, bodyBytes...)
 
@@ -441,6 +442,19 @@ func tierMaxTTL(tier string) time.Duration {
 	}
 }
 
+// tierMaxBodyBytes returns the max request body size for a tier.
+// Scaled to bandwidth allocation: free=25MB, hobby=100MB, pro=500MB.
+func tierMaxBodyBytes(tier string) int64 {
+	switch tier {
+	case "pro":
+		return 500 * 1024 * 1024
+	case "hobby":
+		return 100 * 1024 * 1024
+	default: // free
+		return 25 * 1024 * 1024
+	}
+}
+
 // tierTunnelLimit returns the max active tunnels for a tier.
 func tierTunnelLimit(tier string) int {
 	switch tier {
@@ -535,6 +549,9 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Tag tunnel with owner's tier for per-request enforcement (body limits, etc.)
+	t.Tier = tier
 
 	if req.IdleTTL {
 		t.IdleTTL = true
@@ -779,14 +796,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// so the local service on the client side receives a proper HTTP request.
 	reqBytes := reconstructHTTPRequest(r)
 
-	// Read request body — capped by MaxBodyBytes to prevent OOM (default 500MB, 0 = unlimited)
+	// Tier-based body limit (falls back to global MaxBodyBytes config)
+	bodyLimit := tierMaxBodyBytes(t.Tier)
+	if s.cfg.MaxBodyBytes > 0 && s.cfg.MaxBodyBytes < bodyLimit {
+		bodyLimit = s.cfg.MaxBodyBytes
+	}
 	var bodyBytes []byte
 	if r.Body != nil {
-		if s.cfg.MaxBodyBytes > 0 {
-			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBytes))
-		} else {
-			bodyBytes, _ = io.ReadAll(r.Body)
-		}
+		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	}
 
 	reqPrefix := append(reqBytes, bodyBytes...)
