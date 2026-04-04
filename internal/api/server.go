@@ -237,6 +237,11 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		}
 	}
 
+	// Basic auth check (if configured on this tunnel)
+	if !s.checkTunnelAuth(w, r, t) {
+		return
+	}
+
 	// Per-tunnel request rate limit
 	if !s.checkProxyRateLimit(w, t) {
 		return
@@ -441,6 +446,8 @@ type createTunnelRequest struct {
 	IdleTTL    bool   `json:"idle_ttl,omitempty"`
 	DeviceName string `json:"device_name,omitempty"` // human-readable device name
 	Source     string `json:"source,omitempty"`      // "cli" or "daemon"
+	AuthUser   string `json:"auth_user,omitempty"`   // basic auth username
+	AuthPass   string `json:"auth_pass,omitempty"`   // basic auth password
 }
 
 // tierMaxTTL returns the max TTL for a tier.
@@ -453,6 +460,24 @@ func tierMaxTTL(tier string) time.Duration {
 	default: // free
 		return 2 * time.Hour
 	}
+}
+
+// checkTunnelAuth returns true if the request passes the tunnel's basic auth check.
+// If the tunnel has no auth configured, all requests pass.
+// On success, strips the Authorization header so the local service doesn't see it.
+func (s *Server) checkTunnelAuth(w http.ResponseWriter, r *http.Request, t *tunnel.Tunnel) bool {
+	if t.AuthUser == "" {
+		return true // no auth configured
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok || user != t.AuthUser || pass != t.AuthPass {
+		w.Header().Set("WWW-Authenticate", `Basic realm="NullBore Tunnel"`)
+		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	// Strip tunnel auth header — don't leak it to the local service
+	r.Header.Del("Authorization")
+	return true
 }
 
 // checkProxyRateLimit returns true if the request is allowed through.
@@ -607,6 +632,10 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// Tag tunnel with owner's tier for per-request enforcement (body limits, etc.)
 	t.Tier = tier
+	if req.AuthUser != "" && req.AuthPass != "" {
+		t.AuthUser = req.AuthUser
+		t.AuthPass = req.AuthPass
+	}
 
 	if req.IdleTTL {
 		t.IdleTTL = true
@@ -844,6 +873,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
 			return
 		}
+	}
+
+	// Basic auth check (if configured on this tunnel)
+	if !s.checkTunnelAuth(w, r, t) {
+		return
 	}
 
 	// Per-tunnel request rate limit

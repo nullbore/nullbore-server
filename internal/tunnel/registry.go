@@ -35,6 +35,8 @@ type Tunnel struct {
 	DeviceName string `json:"device_name,omitempty"` // hostname of the connecting device
 	Source     string `json:"source,omitempty"`       // "cli" or "daemon"
 	Tier       string `json:"tier,omitempty"`          // owner's tier at creation time (free/hobby/pro)
+	AuthUser   string `json:"-"`                       // basic auth username (not serialized to API)
+	AuthPass   string `json:"-"`                       // basic auth password (not serialized to API)
 
 	// Internal — not serialized
 	conn            *websocket.Conn
