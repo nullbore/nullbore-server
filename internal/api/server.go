@@ -233,7 +233,7 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 
 	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+		bodyBytes, _ = io.ReadAll(r.Body)
 	}
 	reqPrefix := append(reqBytes, bodyBytes...)
 
@@ -774,17 +774,23 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// so the local service on the client side receives a proper HTTP request.
 	reqBytes := reconstructHTTPRequest(r)
 
-	// Read request body (if any)
+	// Read request body (if any) — no size cap, the body must flow through
+	// to the tunnel client (file uploads, etc.)
 	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+		bodyBytes, _ = io.ReadAll(r.Body)
 	}
 
 	reqPrefix := append(reqBytes, bodyBytes...)
 
 	// Log request for inspection (async, non-blocking)
 	if s.cfg.Store != nil {
-		go s.logRequest(t, r, bodyBytes)
+		// Cap body passed to log (log only needs first 4KB snippet)
+		logBody := bodyBytes
+		if len(logBody) > 4096 {
+			logBody = logBody[:4096]
+		}
+		go s.logRequest(t, r, logBody)
 	}
 
 	// Hijack the HTTP connection to get the raw TCP conn
