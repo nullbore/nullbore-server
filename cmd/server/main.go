@@ -32,6 +32,7 @@ func main() {
 	tlsCacheDir := flag.String("tls-cache", envOr("NULLBORE_TLS_CACHE", ""), "Cert cache directory (default: ~/.nullbore/certs)")
 	apiKeys := flag.String("api-keys", envOr("NULLBORE_API_KEYS", ""), "Comma-separated API keys (dev mode)")
 	baseDomain := flag.String("base-domain", envOr("NULLBORE_BASE_DOMAIN", ""), "Base domain for subdomain routing (e.g. tunnel.nullbore.com)")
+	accountDomain := flag.String("account-domain", envOr("NULLBORE_ACCOUNT_DOMAIN", ""), "Account subdomain domain (e.g. nullbore.com for *.heroapp.nullbore.com)")
 	dbPath := flag.String("db", envOr("NULLBORE_DB", "nullbore.db"), "SQLite database path")
 	eventsDBPath := flag.String("events-db", envOr("NULLBORE_EVENTS_DB", "events.db"), "SQLite events database path")
 	dashPassword := flag.String("dash-password", envOr("NULLBORE_DASH_PASSWORD", ""), "Dashboard password (empty = dashboard disabled)")
@@ -235,6 +236,7 @@ func main() {
 		Store:             db,
 		Events:            events,
 		BaseDomain:        *baseDomain,
+		AccountDomain:     *accountDomain,
 		AdminSecret:       adminSec,
 		DomainResolver:    domainResolver,
 		SubdomainResolver: subdomainResolver,
@@ -243,6 +245,9 @@ func main() {
 
 	if *baseDomain != "" {
 		log.Printf("subdomain routing: *.%s", *baseDomain)
+	}
+	if *accountDomain != "" {
+		log.Printf("account subdomain routing: *.{account}.%s", *accountDomain)
 	}
 
 	// Dashboard

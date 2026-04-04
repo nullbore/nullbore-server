@@ -43,6 +43,7 @@ type Config struct {
 	Events         *store.EventStore // separate event/request log DB (optional)
 	DashHandler    http.Handler
 	BaseDomain     string              // e.g. "tunnel.nullbore.com" — enables subdomain routing
+	AccountDomain  string              // e.g. "nullbore.com" — for *.heroapp.nullbore.com routing
 	AdminSecret    string              // shared secret for admin API (dashboard→server)
 	DomainResolver    *DomainResolver    // custom domain → tunnel slug resolver (optional)
 	SubdomainResolver *SubdomainResolver // account subdomain → user ID resolver (optional)
@@ -133,20 +134,29 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 			host = host[:idx]
 		}
 
-		// Check if this is a subdomain request
+		// Check if this is a tunnel subdomain request: {slug}.tunnel.nullbore.com
 		if strings.HasSuffix(host, suffix) && host != s.cfg.BaseDomain {
-			sub := strings.TrimSuffix(host, suffix)
-			if sub != "" {
+			slug := strings.TrimSuffix(host, suffix)
+			if slug != "" && !strings.Contains(slug, ".") {
+				s.handleSubdomainProxy(w, r, slug)
+				return
+			}
+		}
+
+		// Check if this is an account subdomain request: {tunnel}.{account}.nullbore.com
+		if s.cfg.AccountDomain != "" {
+			acctSuffix := "." + s.cfg.AccountDomain
+			if strings.HasSuffix(host, acctSuffix) && host != s.cfg.AccountDomain {
+				sub := strings.TrimSuffix(host, acctSuffix)
 				parts := strings.SplitN(sub, ".", 2)
 				if len(parts) == 2 {
-					// Two-level: tunnel.account.tunnel.nullbore.com
-					tunnelName := parts[0]
-					accountSub := parts[1]
-					s.handleAccountSubdomainProxy(w, r, accountSub, tunnelName)
+					// Two-level: web.heroapp.nullbore.com → tunnel="web", account="heroapp"
+					s.handleAccountSubdomainProxy(w, r, parts[1], parts[0])
 					return
 				}
-				if !strings.Contains(sub, ".") {
-					s.handleSubdomainProxy(w, r, sub)
+				if len(parts) == 1 && parts[0] != "tunnel" && parts[0] != "www" {
+					// Single-level account subdomain: heroapp.nullbore.com → show index/default tunnel
+					s.handleAccountSubdomainProxy(w, r, parts[0], "")
 					return
 				}
 			}
@@ -350,8 +360,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
-// handleAccountSubdomainProxy handles two-level subdomain routing: tunnel.account.tunnel.nullbore.com
-// Resolves the account subdomain to a user, then finds the named tunnel owned by that user.
+// handleAccountSubdomainProxy handles account subdomain routing.
+// Two-level: web.heroapp.nullbore.com → accountSub="heroapp", tunnelName="web"
+// Single-level: heroapp.nullbore.com → accountSub="heroapp", tunnelName=""
 func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Request, accountSub, tunnelName string) {
 	if s.cfg.SubdomainResolver == nil {
 		http.Error(w, "account subdomains not configured", http.StatusNotFound)
@@ -364,23 +375,28 @@ func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Find the user's tunnel with the matching name
 	tunnels := s.cfg.Registry.GetByClient(userID)
-	var t *tunnel.Tunnel
-	for _, candidate := range tunnels {
-		if candidate.Slug == tunnelName {
-			t = candidate
-			break
+
+	if tunnelName == "" {
+		// heroapp.nullbore.com — route to first active tunnel or show offline
+		if len(tunnels) > 0 {
+			s.handleSubdomainProxy(w, r, tunnels[0].Slug)
+			return
 		}
-	}
-	if t == nil {
-		// No tunnel with that name — show offline page
-		s.renderOfflinePage(w, tunnelName+"."+accountSub)
+		s.renderOfflinePage(w, accountSub)
 		return
 	}
 
-	// Delegate to the normal subdomain proxy handler
-	s.handleSubdomainProxy(w, r, t.Slug)
+	// web.heroapp.nullbore.com — find the named tunnel
+	for _, t := range tunnels {
+		if t.Slug == tunnelName {
+			s.handleSubdomainProxy(w, r, t.Slug)
+			return
+		}
+	}
+
+	// No tunnel with that name
+	s.renderOfflinePage(w, tunnelName+"."+accountSub)
 }
 
 // --- API Handlers ---
@@ -960,13 +976,15 @@ func (s *Server) publicURL(slug string) string {
 }
 
 // publicURLForClient returns the URL using the user's account subdomain if they have one.
+// With account subdomain: https://web.heroapp.nullbore.com
+// Without: https://slug.tunnel.nullbore.com
 func (s *Server) publicURLForClient(slug, token string) string {
-	if s.cfg.BaseDomain != "" {
-		if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok && token != "" {
-			if sub := rp.GetSubdomain(token); sub != "" {
-				return fmt.Sprintf("https://%s.%s.%s", slug, sub, s.cfg.BaseDomain)
-			}
+	if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok && token != "" {
+		if sub := rp.GetSubdomain(token); sub != "" && s.cfg.AccountDomain != "" {
+			return fmt.Sprintf("https://%s.%s.%s", slug, sub, s.cfg.AccountDomain)
 		}
+	}
+	if s.cfg.BaseDomain != "" {
 		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
 	}
 	return fmt.Sprintf("/t/%s", slug)
