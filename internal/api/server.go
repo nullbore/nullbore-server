@@ -278,17 +278,24 @@ func reconstructSubdomainRequest(r *http.Request, slug string) []byte {
 		path += "?" + r.URL.RawQuery
 	}
 
+	isWebSocket := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+
 	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\n", r.Method, path)
 	fmt.Fprintf(&buf, "Host: localhost\r\n")
-	fmt.Fprintf(&buf, "Connection: close\r\n")
+	if isWebSocket {
+		fmt.Fprintf(&buf, "Connection: Upgrade\r\n")
+		fmt.Fprintf(&buf, "Upgrade: websocket\r\n")
+	} else {
+		fmt.Fprintf(&buf, "Connection: close\r\n")
+	}
 
 	for key, vals := range r.Header {
 		lower := strings.ToLower(key)
-		if lower == "host" || lower == "connection" {
+		if lower == "host" || lower == "connection" || lower == "upgrade" {
 			continue
 		}
-		// Strip hop-by-hop headers
-		if lower == "upgrade" || lower == "transfer-encoding" ||
+		// Strip hop-by-hop headers (but keep Sec-WebSocket-* for WS upgrades)
+		if lower == "transfer-encoding" ||
 			lower == "proxy-connection" || lower == "keep-alive" ||
 			lower == "te" || lower == "trailer" {
 			continue
@@ -831,12 +838,17 @@ func reconstructHTTPRequest(r *http.Request) []byte {
 		fmt.Fprintf(&buf, "Host: %s\r\n", r.Host)
 	}
 
-	// Force Connection: close — each inbound request gets its own data WebSocket / pipe,
-	// so there's no keep-alive. Without this, HTTP/1.1 servers hold the connection open
-	// and the pipe deadlocks.
-	fmt.Fprintf(&buf, "Connection: close\r\n")
+	// WebSocket upgrades need Connection: Upgrade + Upgrade: websocket to pass through.
+	// Regular requests get Connection: close (each gets its own data WebSocket / pipe).
+	isWS := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	if isWS {
+		fmt.Fprintf(&buf, "Connection: Upgrade\r\n")
+		fmt.Fprintf(&buf, "Upgrade: websocket\r\n")
+	} else {
+		fmt.Fprintf(&buf, "Connection: close\r\n")
+	}
 
-	// Remaining headers — skip hop-by-hop
+	// Remaining headers — skip hop-by-hop (keep Sec-WebSocket-* for WS)
 	for key, vals := range r.Header {
 		switch strings.ToLower(key) {
 		case "connection", "upgrade", "proxy-connection", "te", "trailer", "host":
