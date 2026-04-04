@@ -135,10 +135,20 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 
 		// Check if this is a subdomain request
 		if strings.HasSuffix(host, suffix) && host != s.cfg.BaseDomain {
-			slug := strings.TrimSuffix(host, suffix)
-			if slug != "" && !strings.Contains(slug, ".") {
-				s.handleSubdomainProxy(w, r, slug)
-				return
+			sub := strings.TrimSuffix(host, suffix)
+			if sub != "" {
+				parts := strings.SplitN(sub, ".", 2)
+				if len(parts) == 2 {
+					// Two-level: tunnel.account.tunnel.nullbore.com
+					tunnelName := parts[0]
+					accountSub := parts[1]
+					s.handleAccountSubdomainProxy(w, r, accountSub, tunnelName)
+					return
+				}
+				if !strings.Contains(sub, ".") {
+					s.handleSubdomainProxy(w, r, sub)
+					return
+				}
 			}
 		}
 
@@ -340,6 +350,39 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// handleAccountSubdomainProxy handles two-level subdomain routing: tunnel.account.tunnel.nullbore.com
+// Resolves the account subdomain to a user, then finds the named tunnel owned by that user.
+func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Request, accountSub, tunnelName string) {
+	if s.cfg.SubdomainResolver == nil {
+		http.Error(w, "account subdomains not configured", http.StatusNotFound)
+		return
+	}
+
+	userID, err := s.cfg.SubdomainResolver.Resolve(accountSub)
+	if err != nil || userID == "" {
+		http.Error(w, "unknown subdomain", http.StatusNotFound)
+		return
+	}
+
+	// Find the user's tunnel with the matching name
+	tunnels := s.cfg.Registry.GetByClient(userID)
+	var t *tunnel.Tunnel
+	for _, candidate := range tunnels {
+		if candidate.Slug == tunnelName {
+			t = candidate
+			break
+		}
+	}
+	if t == nil {
+		// No tunnel with that name — show offline page
+		s.renderOfflinePage(w, tunnelName+"."+accountSub)
+		return
+	}
+
+	// Delegate to the normal subdomain proxy handler
+	s.handleSubdomainProxy(w, r, t.Slug)
+}
+
 // --- API Handlers ---
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -374,9 +417,9 @@ func tierMaxTTL(tier string) time.Duration {
 func tierTunnelLimit(tier string) int {
 	switch tier {
 	case "pro":
-		return 10
+		return 20
 	case "hobby":
-		return 3
+		return 5
 	default: // free or unknown
 		return 1
 	}
@@ -459,16 +502,6 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If no explicit name given and user has a claimed subdomain, try using it
-	if req.Name == "" {
-		if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if sub := rp.GetSubdomain(token); sub != "" {
-				req.Name = sub
-			}
-		}
-	}
-
 	t, err := s.cfg.Registry.Create(clientID, req.LocalPort, req.Name, ttl)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -502,13 +535,14 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Events.LogEvent(t.ID, t.ClientID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
 	}
 
-	// Build response with public URL
+	// Build response with public URL (use account subdomain if available)
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	resp := struct {
 		*tunnel.Tunnel
 		PublicURL string `json:"public_url"`
 	}{
 		Tunnel:    t,
-		PublicURL: s.publicURL(t.Slug),
+		PublicURL: s.publicURLForClient(t.Slug, token),
 	}
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -521,9 +555,10 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 		*tunnel.Tunnel
 		PublicURL string `json:"public_url"`
 	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	result := make([]tunnelWithURL, 0, len(tunnels))
 	for _, t := range tunnels {
-		result = append(result, tunnelWithURL{Tunnel: t, PublicURL: s.publicURL(t.Slug)})
+		result = append(result, tunnelWithURL{Tunnel: t, PublicURL: s.publicURLForClient(t.Slug, token)})
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -543,7 +578,7 @@ func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		*tunnel.Tunnel
 		PublicURL string `json:"public_url"`
-	}{Tunnel: t, PublicURL: s.publicURL(t.Slug)}
+	}{Tunnel: t, PublicURL: s.publicURLForClient(t.Slug, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -919,6 +954,19 @@ func (s *Server) handleAdminSuspendTunnel(w http.ResponseWriter, r *http.Request
 // Uses subdomain routing if base_domain is set, otherwise falls back to path-based.
 func (s *Server) publicURL(slug string) string {
 	if s.cfg.BaseDomain != "" {
+		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
+	}
+	return fmt.Sprintf("/t/%s", slug)
+}
+
+// publicURLForClient returns the URL using the user's account subdomain if they have one.
+func (s *Server) publicURLForClient(slug, token string) string {
+	if s.cfg.BaseDomain != "" {
+		if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok && token != "" {
+			if sub := rp.GetSubdomain(token); sub != "" {
+				return fmt.Sprintf("https://%s.%s.%s", slug, sub, s.cfg.BaseDomain)
+			}
+		}
 		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
 	}
 	return fmt.Sprintf("/t/%s", slug)
