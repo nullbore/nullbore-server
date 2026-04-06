@@ -69,11 +69,12 @@ func NewServer(cfg Config) *Server {
 		wsHub: NewWSHub(cfg.Registry),
 		// Rate limit: 10 tunnel creations per minute per client, burst of 5
 		rateLimiter: NewRateLimiter(10, time.Minute, 5),
-		// Per-tunnel proxy rate limiters by tier
+		// Per-tunnel proxy rate limiters by tier.
+		// Use per-second refill intervals to avoid minute-boundary starvation.
 		proxyLimiters: map[string]*RateLimiter{
-			"free":  NewRateLimiter(60, time.Minute, 20),   // 1 req/s, burst 20
-			"hobby": NewRateLimiter(300, time.Minute, 60),  // 5 req/s, burst 60
-			"pro":   NewRateLimiter(600, time.Minute, 100), // 10 req/s, burst 100
+			"free":  NewRateLimiter(1, time.Second, 20),   // 1 req/s, burst 20
+			"hobby": NewRateLimiter(5, time.Second, 60),  // 5 req/s, burst 60
+			"pro":   NewRateLimiter(10, time.Second, 100), // 10 req/s, burst 100
 		},
 	}
 	s.routes()
@@ -491,7 +492,7 @@ func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bo
 		limiter = s.proxyLimiters["free"]
 	}
 	if !limiter.Allow(t.ID) {
-		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, "429 Too Many Requests — tunnel rate limit exceeded", http.StatusTooManyRequests)
 		return false
 	}
