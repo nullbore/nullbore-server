@@ -216,6 +216,7 @@ func main() {
 		Email:         *tlsEmail,
 		CacheDir:      *tlsCacheDir,
 		BaseDomain:    *baseDomain,
+		AccountDomain: *accountDomain,
 		DomainChecker: domainResolver, // nil if no dashboard configured
 	}
 

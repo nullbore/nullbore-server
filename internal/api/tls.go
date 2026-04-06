@@ -28,7 +28,8 @@ type TLSConfig struct {
 	Domains    []string // e.g. ["tunnel.nullbore.com"]
 	CacheDir   string   // defaults to ~/.nullbore/certs
 	Email      string   // optional, for Let's Encrypt notifications
-	BaseDomain string   // if set, auto-cert {slug}.basedomain subdomains on demand
+	BaseDomain    string // if set, auto-cert {slug}.basedomain subdomains on demand
+	AccountDomain string // if set, supports account routing hosts like {tunnel}.{account}.accountDomain
 
 	// Custom domain support — check if a domain is registered before issuing certs
 	DomainChecker DomainChecker
@@ -76,14 +77,25 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 			os.MkdirAll(cacheDir, 0700)
 
 			checker := t.DomainChecker
+			accountSuffix := ""
+			if t.AccountDomain != "" {
+				accountSuffix = "." + t.AccountDomain
+			}
 			manager := &autocert.Manager{
 				Prompt: autocert.AcceptTOS,
 				Cache:  autocert.DirCache(cacheDir),
 				HostPolicy: func(ctx context.Context, host string) error {
-					// Only allow registered custom domains
+					// Allow account subdomain hosts (e.g. web.heroapp.nullbore.com)
+					if accountSuffix != "" && strings.HasSuffix(host, accountSuffix) && host != t.AccountDomain {
+						left := strings.TrimSuffix(host, accountSuffix)
+						if left != "" && strings.Count(left, ".") <= 1 {
+							return nil
+						}
+					}
+					// Otherwise only allow registered custom domains
 					_, _, err := checker.Resolve(host)
 					if err != nil {
-						return fmt.Errorf("host %q not a registered custom domain", host)
+						return fmt.Errorf("host %q not a registered custom/account domain", host)
 					}
 					return nil
 				},
@@ -176,6 +188,7 @@ func (t *TLSConfig) buildACMEConfig() (*tls.Config, error) {
 // hostPolicy returns an autocert.HostPolicy that accepts:
 // 1. Explicitly listed domains (from -tls-domain)
 // 2. Any {slug}.baseDomain subdomain (if BaseDomain is set)
+// 3. Account hosts like {account}.accountDomain and {tunnel}.{account}.accountDomain
 func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
 	// Build whitelist set for fast lookup
 	allowed := make(map[string]bool, len(t.Domains))
@@ -187,16 +200,27 @@ func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
 	if t.BaseDomain != "" {
 		suffix = "." + t.BaseDomain
 	}
+	accountSuffix := ""
+	if t.AccountDomain != "" {
+		accountSuffix = "." + t.AccountDomain
+	}
 
 	return func(ctx context.Context, host string) error {
 		// Check explicit whitelist
 		if allowed[host] {
 			return nil
 		}
-		// Check subdomain pattern
+		// Check {slug}.baseDomain pattern
 		if suffix != "" && strings.HasSuffix(host, suffix) {
 			slug := strings.TrimSuffix(host, suffix)
 			if slug != "" && !strings.Contains(slug, ".") {
+				return nil
+			}
+		}
+		// Check account domain hosts: {account}.domain or {tunnel}.{account}.domain
+		if accountSuffix != "" && strings.HasSuffix(host, accountSuffix) && host != t.AccountDomain {
+			left := strings.TrimSuffix(host, accountSuffix)
+			if left != "" && strings.Count(left, ".") <= 1 {
 				return nil
 			}
 		}
