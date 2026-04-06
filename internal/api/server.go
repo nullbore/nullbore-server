@@ -211,9 +211,9 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		return
 	}
 
-	// Named tunnels are reserved for account/custom domain namespaces.
-	// Do not serve named slugs on the global base domain (e.g. name.tunnel.nullbore.com).
-	if t.Name != "" && s.cfg.BaseDomain != "" {
+	// User-selected slugs are reserved for account/custom domain namespaces.
+	// Do not serve non-random slugs on the global base domain (e.g. name.tunnel.nullbore.com).
+	if !isGeneratedSlug(slug) && s.cfg.BaseDomain != "" {
 		host := r.Host
 		if h, _, err := net.SplitHostPort(r.Host); err == nil {
 			host = h
@@ -1189,6 +1189,21 @@ func validateTunnelName(name string) error {
 		return fmt.Errorf("tunnel name %q is reserved", name)
 	}
 	return nil
+}
+
+// isGeneratedSlug reports whether a slug looks like an auto-generated random slug
+// (12 lowercase hex chars). User-chosen slugs should not resolve on base domain.
+func isGeneratedSlug(slug string) bool {
+	if len(slug) != 12 {
+		return false
+	}
+	for i := 0; i < len(slug); i++ {
+		c := slug[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // logRequest records request metadata for the tunnel inspection log.
