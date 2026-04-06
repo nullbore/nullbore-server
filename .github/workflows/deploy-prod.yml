@@ -24,6 +24,16 @@ jobs:
         with:
           ref: main
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.1'
+
+      - name: Build linux binary
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o nullbore-server ./cmd/server
+
       - name: Start SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
@@ -49,21 +59,12 @@ jobs:
           : "${PROD_HOST:?NB_PROD_HOST is required}"
           : "${PROD_USER:?NB_PROD_USER is required}"
 
+          scp -P "${PROD_PORT:-22}" ./nullbore-server "$PROD_USER@$PROD_HOST:/usr/local/bin/nullbore-server.new"
+
           ssh -p "${PROD_PORT:-22}" "$PROD_USER@$PROD_HOST" <<'EOF'
           set -euo pipefail
-
-          if [ ! -d /opt/nullbore-server/.git ]; then
-            git clone https://github.com/nullbore/nullbore-server.git /opt/nullbore-server
-          fi
-
-          cd /opt/nullbore-server
-          git fetch origin
-          git checkout main
-          git reset --hard origin/main
-
-          export CGO_ENABLED=1
-          go build -o /usr/local/bin/nullbore-server ./cmd/server
-
+          chmod +x /usr/local/bin/nullbore-server.new
+          mv /usr/local/bin/nullbore-server.new /usr/local/bin/nullbore-server
           systemctl restart nullbore-server
           systemctl is-active --quiet nullbore-server
           EOF
