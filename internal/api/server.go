@@ -573,7 +573,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 			// Named tunnels require an account subdomain (Hobby+) or custom domain (Pro).
 			// Without one, names would collide in the global tunnel.nullbore.com namespace.
 			hasNamespace := false
-			if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
+			if rp := getRemoteProvider(s.cfg.Auth); rp != nil {
 				token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 				if sub := rp.GetSubdomain(token); sub != "" {
 					hasNamespace = true
@@ -613,7 +613,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bandwidth limit check
-	if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok {
+	if rp := getRemoteProvider(s.cfg.Auth); rp != nil {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		used, limit := rp.GetBandwidthInfo(token)
 		if limit > 0 && used >= limit {
@@ -1116,7 +1116,7 @@ func (s *Server) publicURL(slug string) string {
 // With account subdomain: https://web.heroapp.nullbore.com
 // Without: https://slug.tunnel.nullbore.com
 func (s *Server) publicURLForClient(slug, token string) string {
-	if rp, ok := s.cfg.Auth.(*auth.RemoteProvider); ok && token != "" {
+	if rp := getRemoteProvider(s.cfg.Auth); rp != nil && token != "" {
 		if sub := rp.GetSubdomain(token); sub != "" && s.cfg.AccountDomain != "" {
 			return fmt.Sprintf("https://%s.%s.%s", slug, sub, s.cfg.AccountDomain)
 		}
@@ -1125,6 +1125,18 @@ func (s *Server) publicURLForClient(slug, token string) string {
 		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
 	}
 	return fmt.Sprintf("/t/%s", slug)
+}
+
+func getRemoteProvider(p auth.Provider) *auth.RemoteProvider {
+	switch v := p.(type) {
+	case *auth.RemoteProvider:
+		return v
+	case *auth.ComboProvider:
+		if rp, ok := v.Primary.(*auth.RemoteProvider); ok {
+			return rp
+		}
+	}
+	return nil
 }
 
 // --- Helpers ---
