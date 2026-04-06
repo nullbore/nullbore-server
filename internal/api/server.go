@@ -211,6 +211,23 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		return
 	}
 
+	// Named tunnels are reserved for account/custom domain namespaces.
+	// Do not serve named slugs on the global base domain (e.g. name.tunnel.nullbore.com).
+	if t.Name != "" && s.cfg.BaseDomain != "" {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			host = h
+		}
+		suffix := "." + s.cfg.BaseDomain
+		if strings.HasSuffix(host, suffix) {
+			left := strings.TrimSuffix(host, suffix)
+			if left == slug && !strings.Contains(left, ".") {
+				http.Error(w, "tunnel not found", http.StatusNotFound)
+				return
+			}
+		}
+	}
+
 	if t.Suspended {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
