@@ -72,9 +72,9 @@ func NewServer(cfg Config) *Server {
 		// Per-tunnel proxy rate limiters by tier.
 		// Use per-second refill intervals to avoid minute-boundary starvation.
 		proxyLimiters: map[string]*RateLimiter{
-			"free":  NewRateLimiter(1, time.Second, 20),   // 1 req/s, burst 20
-			"hobby": NewRateLimiter(5, time.Second, 60),  // 5 req/s, burst 60
-			"pro":   NewRateLimiter(10, time.Second, 100), // 10 req/s, burst 100
+			"free":  NewRateLimiter(5, time.Second, 40),     // 5 req/s, burst 40
+			"hobby": NewRateLimiter(30, time.Second, 150),   // 30 req/s, burst 150
+			"pro":   NewRateLimiter(120, time.Second, 500),  // 120 req/s, burst 500
 		},
 	}
 	s.routes()
