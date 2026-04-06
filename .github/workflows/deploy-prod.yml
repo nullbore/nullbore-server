@@ -1,0 +1,75 @@
+name: Deploy Production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.NB_PROD_SSH_KEY }}
+
+      - name: Add host key
+        env:
+          PROD_HOST: ${{ secrets.NB_PROD_HOST }}
+          PROD_PORT: ${{ secrets.NB_PROD_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${PROD_PORT:-22}" -H "$PROD_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy to tunnel server
+        env:
+          PROD_HOST: ${{ secrets.NB_PROD_HOST }}
+          PROD_USER: ${{ secrets.NB_PROD_USER }}
+          PROD_PORT: ${{ secrets.NB_PROD_PORT }}
+          PROD_HEALTH_URL: ${{ secrets.NB_PROD_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          : "${PROD_HOST:?NB_PROD_HOST is required}"
+          : "${PROD_USER:?NB_PROD_USER is required}"
+
+          ssh -p "${PROD_PORT:-22}" "$PROD_USER@$PROD_HOST" <<'EOF'
+          set -euo pipefail
+
+          if [ ! -d /opt/nullbore-server/.git ]; then
+            git clone https://github.com/nullbore/nullbore-server.git /opt/nullbore-server
+          fi
+
+          cd /opt/nullbore-server
+          git fetch origin
+          git checkout main
+          git reset --hard origin/main
+
+          export CGO_ENABLED=1
+          go build -o /usr/local/bin/nullbore-server ./cmd/server
+
+          systemctl restart nullbore-server
+          systemctl is-active --quiet nullbore-server
+          EOF
+
+          HEALTH_URL="${PROD_HEALTH_URL:-https://tunnel.nullbore.com/health}"
+          curl -fsS "$HEALTH_URL" >/dev/null
+
+      - name: Deploy summary
+        run: echo "✅ Production deploy complete" >> "$GITHUB_STEP_SUMMARY"
