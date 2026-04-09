@@ -18,6 +18,12 @@ type DomainChecker interface {
 	Resolve(domain string) (slug string, userID string, err error)
 }
 
+// AccountChecker checks if an account subdomain is currently registered.
+// SubdomainResolver satisfies this interface.
+type AccountChecker interface {
+	Resolve(name string) (userID string, err error)
+}
+
 // TLSConfig holds TLS-related settings.
 type TLSConfig struct {
 	// Manual cert/key paths
@@ -33,6 +39,48 @@ type TLSConfig struct {
 
 	// Custom domain support — check if a domain is registered before issuing certs
 	DomainChecker DomainChecker
+
+	// Account subdomain support — check if an account subdomain is currently registered
+	// before issuing certs for {account}.AccountDomain or {leaf}.{account}.AccountDomain.
+	// Required to safely enable account subdomain routing — without it, ACME issuance
+	// for *.{anything}.AccountDomain is rejected.
+	AccountChecker AccountChecker
+}
+
+// accountAllowedByChecker returns true if `host` is one of:
+//   - {account}.AccountDomain      (left has 0 dots)
+//   - {leaf}.{account}.AccountDomain (left has 1 dot)
+// AND the account name resolves via checker. Caller must ensure host has the
+// AccountDomain suffix and is not equal to AccountDomain itself.
+//
+// Returning false here causes autocert to refuse the order — no ACME call is
+// made. Any string is a *potentially* valid future account; we gate on the
+// current state of registrations to prevent unbounded cert provisioning.
+func accountAllowedByChecker(host, accountDomain string, checker AccountChecker) bool {
+	if checker == nil || accountDomain == "" {
+		return false
+	}
+	left := strings.TrimSuffix(host, "."+accountDomain)
+	if left == "" {
+		return false
+	}
+	dots := strings.Count(left, ".")
+	if dots > 1 {
+		return false
+	}
+	var account string
+	if dots == 0 {
+		account = left
+	} else {
+		// "leaf.account"
+		idx := strings.IndexByte(left, '.')
+		account = left[idx+1:]
+	}
+	if account == "" {
+		return false
+	}
+	userID, err := checker.Resolve(account)
+	return err == nil && userID != ""
 }
 
 // IsEnabled returns true if any TLS mode is configured.
@@ -77,6 +125,7 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 			os.MkdirAll(cacheDir, 0700)
 
 			checker := t.DomainChecker
+			accountChecker := t.AccountChecker
 			accountSuffix := ""
 			if t.AccountDomain != "" {
 				accountSuffix = "." + t.AccountDomain
@@ -86,11 +135,14 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 				Cache:  autocert.DirCache(cacheDir),
 				HostPolicy: func(ctx context.Context, host string) error {
 					// Allow account subdomain hosts (e.g. web.heroapp.nullbore.com)
+					// only when the {account} segment resolves to a registered account.
+					// Without this check, ACME issuance can be triggered for any
+					// *.*.AccountDomain by an unauthenticated visitor.
 					if accountSuffix != "" && strings.HasSuffix(host, accountSuffix) && host != t.AccountDomain {
-						left := strings.TrimSuffix(host, accountSuffix)
-						if left != "" && strings.Count(left, ".") <= 1 {
+						if accountAllowedByChecker(host, t.AccountDomain, accountChecker) {
 							return nil
 						}
+						return fmt.Errorf("host %q not a registered account subdomain", host)
 					}
 					// Otherwise only allow registered custom domains
 					_, _, err := checker.Resolve(host)
@@ -188,7 +240,9 @@ func (t *TLSConfig) buildACMEConfig() (*tls.Config, error) {
 // hostPolicy returns an autocert.HostPolicy that accepts:
 // 1. Explicitly listed domains (from -tls-domain)
 // 2. Any {slug}.baseDomain subdomain (if BaseDomain is set)
-// 3. Account hosts like {account}.accountDomain and {tunnel}.{account}.accountDomain
+// 3. Account hosts like {account}.accountDomain and {tunnel}.{account}.accountDomain,
+//    but only when the {account} segment resolves via AccountChecker. Without
+//    AccountChecker, account hosts are rejected — ACME orders are not placed.
 func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
 	// Build whitelist set for fast lookup
 	allowed := make(map[string]bool, len(t.Domains))
@@ -204,6 +258,7 @@ func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
 	if t.AccountDomain != "" {
 		accountSuffix = "." + t.AccountDomain
 	}
+	accountChecker := t.AccountChecker
 
 	return func(ctx context.Context, host string) error {
 		// Check explicit whitelist
@@ -217,10 +272,11 @@ func (t *TLSConfig) hostPolicy() autocert.HostPolicy {
 				return nil
 			}
 		}
-		// Check account domain hosts: {account}.domain or {tunnel}.{account}.domain
+		// Check account domain hosts: only allowed if the account is currently
+		// registered. Returning an error here prevents autocert from placing
+		// any ACME order — protects Let's Encrypt rate limits from probe storms.
 		if accountSuffix != "" && strings.HasSuffix(host, accountSuffix) && host != t.AccountDomain {
-			left := strings.TrimSuffix(host, accountSuffix)
-			if left != "" && strings.Count(left, ".") <= 1 {
+			if accountAllowedByChecker(host, t.AccountDomain, accountChecker) {
 				return nil
 			}
 		}

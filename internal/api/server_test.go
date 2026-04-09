@@ -357,3 +357,85 @@ func TestFullRelay(t *testing.T) {
 	}
 }
 
+// TestAccountSubdomainRouting404s verifies the security-critical 404 paths
+// for account subdomain routing. Every "not found" condition must return a
+// generic 404 — not a branded page, not a 503, not a host echoback — so
+// attackers cannot enumerate which accounts or leaf names exist.
+//
+// Covered scenarios:
+//   - bare account host (heroapp.nullbore.com) with no default tunnel: 404
+//   - unknown leaf under registered account (carp.heroapp.nullbore.com): 404
+//   - unknown account, single-level (fake.nullbore.com): 404
+//   - unknown account, leaf (leaf.fake.nullbore.com): 404
+func TestAccountSubdomainRouting404s(t *testing.T) {
+	// Tiny dashboard stub: only "heroapp" is registered, owned by "user-1".
+	dash := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/resolve-subdomain" {
+			http.NotFound(w, r)
+			return
+		}
+		name := r.URL.Query().Get("name")
+		if name == "heroapp" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"user_id":"user-1"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer dash.Close()
+
+	registry := tunnel.NewRegistry()
+	// Create a named tunnel "shark" owned by user-1. We don't attach a WS
+	// client — we never exercise the proxy path, only the 404 paths.
+	if _, err := registry.Create("user-1", 8080, "shark", time.Hour); err != nil {
+		t.Fatalf("registry.Create: %v", err)
+	}
+
+	srv := NewServer(Config{
+		Auth:              auth.NewStaticProvider("nbk_test_secret"),
+		Registry:          registry,
+		BaseDomain:        "tunnel.nullbore.com",
+		AccountDomain:     "nullbore.com",
+		SubdomainResolver: NewSubdomainResolver(dash.URL, ""),
+	})
+
+	// Wrap the mux exactly as ListenAndServe does, so we exercise the
+	// real subdomainHandler routing layer.
+	ts := httptest.NewServer(srv.subdomainHandler(srv.mux))
+	defer ts.Close()
+
+	cases := []struct {
+		name string
+		host string
+	}{
+		{"bare registered account routes nowhere by default", "heroapp.nullbore.com"},
+		{"unknown leaf under registered account is 404", "carp.heroapp.nullbore.com"},
+		{"unknown bare account is 404", "fake.nullbore.com"},
+		{"unknown leaf under unknown account is 404", "leaf.fake.nullbore.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+			req.Host = tc.host
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("status: got %d, want 404 (body=%q)", resp.StatusCode, string(body))
+			}
+			// Body must NOT echo back the hostname or account name —
+			// that would defeat the indistinguishability property.
+			bodyStr := string(body)
+			for _, leak := range []string{"heroapp", "carp", "fake", "leaf"} {
+				if strings.Contains(bodyStr, leak) {
+					t.Errorf("404 body leaks %q (host=%s, body=%q)", leak, tc.host, bodyStr)
+				}
+			}
+		})
+	}
+}
+

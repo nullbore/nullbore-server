@@ -186,28 +186,16 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 }
 
 // handleSubdomainProxy handles proxying for subdomain-based tunnel requests.
+//
+// The base tunnel domain ({slug}.tunnel.nullbore.com) and the account namespace
+// (*.heroapp.nullbore.com) are separate routing planes. A slug miss on the base
+// domain must NOT fall back to account resolution — that would let bare global
+// hostnames silently route to a user's first active tunnel and leak account
+// existence.
 func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, slug string) {
 	t, ok := s.cfg.Registry.GetBySlug(slug)
-
-	// If no direct tunnel match, try account subdomain resolution
-	if !ok && s.cfg.SubdomainResolver != nil {
-		userID, err := s.cfg.SubdomainResolver.Resolve(slug)
-		if err == nil && userID != "" {
-			// Find the user's active tunnels and route to the most recent
-			tunnels := s.cfg.Registry.GetByClient(userID)
-			if len(tunnels) > 0 {
-				t = tunnels[0]
-				ok = true
-			} else {
-				// User has a subdomain but no active tunnels
-				s.renderOfflinePage(w, slug)
-				return
-			}
-		}
-	}
-
 	if !ok {
-		http.Error(w, "tunnel not found", http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
@@ -412,40 +400,48 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // handleAccountSubdomainProxy handles account subdomain routing.
 // Two-level: web.heroapp.nullbore.com → accountSub="heroapp", tunnelName="web"
 // Single-level: heroapp.nullbore.com → accountSub="heroapp", tunnelName=""
+//
+// Security model: every non-match path returns the same generic 404 as
+// writeNotFound, so an attacker cannot distinguish:
+//   - account subdomains not configured at all
+//   - unknown account
+//   - real account / unknown leaf
+//   - real account / no default tunnel (bare host)
+// Any divergence here becomes an enumeration oracle for which accounts and
+// leaf names exist.
 func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Request, accountSub, tunnelName string) {
 	if s.cfg.SubdomainResolver == nil {
-		http.Error(w, "account subdomains not configured", http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
 
 	userID, err := s.cfg.SubdomainResolver.Resolve(accountSub)
 	if err != nil || userID == "" {
-		http.Error(w, "unknown subdomain", http.StatusNotFound)
+		writeNotFound(w)
 		return
 	}
-
-	tunnels := s.cfg.Registry.GetByClient(userID)
 
 	if tunnelName == "" {
-		// heroapp.nullbore.com — route to first active tunnel or show offline
-		if len(tunnels) > 0 {
-			s.handleSubdomainProxy(w, r, tunnels[0].Slug)
-			return
-		}
-		s.renderOfflinePage(w, accountSub)
+		// Bare heroapp.nullbore.com. We deliberately do NOT fall back to
+		// "first active tunnel" — that would silently expose whichever tunnel
+		// happened to sort first under the account's bare hostname, which is
+		// non-deterministic and violates the rule that named tunnels must be
+		// reached via their exact named subdomain. A future opt-in default
+		// tunnel field on the account can re-enable bare-host routing.
+		writeNotFound(w)
 		return
 	}
 
-	// web.heroapp.nullbore.com — find the named tunnel
+	// {leaf}.heroapp.nullbore.com — only an exact tunnel-name match proxies.
+	// Anything else is indistinguishable from "account does not exist".
+	tunnels := s.cfg.Registry.GetByClient(userID)
 	for _, t := range tunnels {
 		if t.Slug == tunnelName {
 			s.handleSubdomainProxy(w, r, t.Slug)
 			return
 		}
 	}
-
-	// No tunnel with that name
-	s.renderOfflinePage(w, tunnelName+"."+accountSub)
+	writeNotFound(w)
 }
 
 // --- API Handlers ---
@@ -1245,11 +1241,16 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
 	}
 }
 
-// renderOfflinePage shows a branded "tunnel offline" page for account subdomains with no active tunnels.
-func (s *Server) renderOfflinePage(w http.ResponseWriter, subdomain string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s — Offline</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:420px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}.sub{color:#6366f1;font-family:monospace;font-size:1rem}a{color:#6366f1}</style></head><body><div><div class="icon">🌙</div><h1>Tunnel Offline</h1><p class="sub">%s.tunnel.nullbore.com</p><p style="margin-top:1rem;">This endpoint is registered but has no active tunnels right now.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`, subdomain, subdomain)
+// writeNotFound returns a generic 404 with no information that could leak
+// account or tunnel-name existence. Every "not found" code path under the
+// account-subdomain plane MUST funnel through here so responses are byte-for-byte
+// identical regardless of which condition failed (unknown account, unknown leaf,
+// resolver not configured, etc.). Any branding or hostname echoback turns this
+// into an enumeration oracle.
+func writeNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprint(w, "404 not found\n")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

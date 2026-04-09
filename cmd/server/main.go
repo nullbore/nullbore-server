@@ -209,23 +209,28 @@ func main() {
 		slog.Info("custom domain resolver configured", "target", *webhookTarget)
 	}
 
-	tlsCfg := &api.TLSConfig{
-		CertFile:      *tlsCert,
-		KeyFile:       *tlsKey,
-		Domains:       domains,
-		Email:         *tlsEmail,
-		CacheDir:      *tlsCacheDir,
-		BaseDomain:    *baseDomain,
-		AccountDomain: *accountDomain,
-		DomainChecker: domainResolver, // nil if no dashboard configured
-	}
-
-	// Account subdomain resolver — queries dashboard for subdomain→user mapping
+	// Account subdomain resolver — queries dashboard for subdomain→user mapping.
+	// Constructed before TLSConfig so it can also gate ACME issuance for
+	// *.{account}.AccountDomain hosts (without it, the TLS host policy rejects
+	// account subdomains entirely — required to avoid Let's Encrypt rate-limit
+	// abuse via probes against arbitrary names).
 	var subdomainResolver *api.SubdomainResolver
 	if *webhookTarget != "" && *webhookSecret != "" {
 		subdomainResolver = api.NewSubdomainResolver(*webhookTarget, *webhookSecret)
 		subdomainResolver.StartCacheReaper()
 		slog.Info("account subdomain resolver configured")
+	}
+
+	tlsCfg := &api.TLSConfig{
+		CertFile:       *tlsCert,
+		KeyFile:        *tlsKey,
+		Domains:        domains,
+		Email:          *tlsEmail,
+		CacheDir:       *tlsCacheDir,
+		BaseDomain:     *baseDomain,
+		AccountDomain:  *accountDomain,
+		DomainChecker:  domainResolver,    // nil if no dashboard configured
+		AccountChecker: subdomainResolver, // nil if no dashboard configured
 	}
 
 	// Build server config
