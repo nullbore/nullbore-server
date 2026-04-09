@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 0  # need full history for git describe
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -32,7 +33,11 @@ jobs:
       - name: Build linux binary
         run: |
           set -euo pipefail
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o nullbore-server ./cmd/server
+          VERSION=$(git describe --tags --always --dirty)
+          echo "Building $VERSION"
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-X github.com/nullbore/nullbore-server/internal/api.ServerVersion=$VERSION" \
+            -o nullbore-server ./cmd/server
 
       - name: Start SSH agent
         uses: webfactory/ssh-agent@v0.9.0
@@ -70,7 +75,17 @@ jobs:
           EOF
 
           HEALTH_URL="${PROD_HEALTH_URL:-https://tunnel.nullbore.com/health}"
-          curl -fsS "$HEALTH_URL" >/dev/null
+          # Verify the live server actually serves the version we just built —
+          # catches "deploy said success but the binary didn't swap" failures.
+          EXPECTED_VERSION=$(git describe --tags --always --dirty)
+          LIVE_RESPONSE=$(curl -fsS "$HEALTH_URL")
+          echo "Health response: $LIVE_RESPONSE"
+          if ! echo "$LIVE_RESPONSE" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
+            echo "::error::Live server version mismatch — expected $EXPECTED_VERSION"
+            echo "::error::Got: $LIVE_RESPONSE"
+            exit 1
+          fi
+          echo "✅ Live server version matches: $EXPECTED_VERSION"
 
       - name: Deploy summary
         run: echo "✅ Production deploy complete" >> "$GITHUB_STEP_SUMMARY"

@@ -34,6 +34,8 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for git describe
 
       - uses: actions/setup-go@v5
         with:
@@ -44,7 +46,10 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o nullbore-server-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/server
+          VERSION=$(git describe --tags --always --dirty)
+          CGO_ENABLED=0 go build \
+            -ldflags="-s -w -X github.com/nullbore/nullbore-server/internal/api.ServerVersion=$VERSION" \
+            -o nullbore-server-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/server
 
       - uses: actions/upload-artifact@v4
         with:
