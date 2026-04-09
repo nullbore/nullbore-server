@@ -8,3 +8,6 @@ nullbore.db
 nullbore-server-linux
 server
 nullbore-server
+
+# Local Docker build/test caches (see Makefile)
+/.cache/
