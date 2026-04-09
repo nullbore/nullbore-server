@@ -882,6 +882,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Suspended check — without this, /v1/tunnels/{id}/suspend only
+	// blocks subdomain-based access (handleSubdomainProxy already checks
+	// this), and path-based callers can still hit a "suspended" tunnel.
+	// Caught by TestAdvancedTunnelLifecycle.
+	if t.Suspended {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tunnel Suspended</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">⏸️</div><h1>Tunnel Suspended</h1><p>This tunnel has been temporarily suspended by its owner.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
+		return
+	}
+
 	if time.Now().After(t.ExpiresAt) {
 		http.Error(w, "tunnel expired", http.StatusGone)
 		return

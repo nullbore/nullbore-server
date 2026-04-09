@@ -285,9 +285,17 @@ func main() {
 		AdminSecret:       adminSec,
 		DomainResolver:    domainResolver,
 		SubdomainResolver: subdomainResolver,
-		IPChecker:         remoteProvider, // nil if no remote auth configured
 		MaxBodyBytes:      int64(*maxBodyMB) * 1024 * 1024,
 		TrustedProxies:    trustedProxyCIDRs,
+	}
+	// IPChecker is an interface field, so assigning a typed-nil pointer
+	// (`*RemoteProvider(nil)`) makes the interface non-nil-but-broken: code
+	// guarded by `if cfg.IPChecker != nil` would still call methods on the
+	// nil receiver and panic. Only assign when the concrete provider exists.
+	// Caught by TestAdvancedMultiServerIsolation in workspace/integration on
+	// the path-based proxy path (handleProxy → GetIPAllowlistForUser).
+	if remoteProvider != nil {
+		cfg.IPChecker = remoteProvider
 	}
 
 	if *baseDomain != "" {
