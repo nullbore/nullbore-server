@@ -216,8 +216,29 @@ func (r *Registry) GetByClient(clientID string) []*Tunnel {
 	return result
 }
 
-// Create registers a new tunnel and returns it.
-func (r *Registry) Create(clientID string, localPort int, name string, ttl time.Duration) (*Tunnel, error) {
+// CreateOptions controls tunnel creation. LocalPort and TTL are required;
+// the rest are optional. All fields are applied to the Tunnel BEFORE it is
+// published into the registry's slug/id maps so concurrent proxy requests
+// can never observe a partially-initialized tunnel — see the data-race fix
+// commit for the bug this prevents.
+type CreateOptions struct {
+	LocalPort  int
+	TTL        time.Duration
+	Name       string // user-chosen slug; empty = generated random slug
+	Tier       string // owner's tier (free/hobby/pro)
+	DeviceName string
+	Source     string // "cli" or "daemon"
+	IdleTTL    bool
+	AuthUser   string // basic auth username (empty = no auth)
+	AuthPass   string // basic auth password
+}
+
+// CreateWithOptions registers a new tunnel and returns it with all
+// metadata atomically applied before publication. Prefer this over Create
+// when setting any of Tier, IdleTTL, AuthUser, AuthPass, DeviceName, or
+// Source — direct field writes on a published tunnel race against
+// concurrent proxy requests that look it up by slug.
+func (r *Registry) CreateWithOptions(clientID string, opts CreateOptions) (*Tunnel, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -234,6 +255,7 @@ func (r *Registry) Create(clientID string, localPort int, name string, ttl time.
 		}
 	}
 
+	ttl := opts.TTL
 	if ttl == 0 {
 		ttl = 1 * time.Hour
 	}
@@ -242,43 +264,64 @@ func (r *Registry) Create(clientID string, localPort int, name string, ttl time.
 	}
 
 	slug := generateSlug()
-	if name != "" {
+	if opts.Name != "" {
 		// Check if this name is already in use
-		if existingID, exists := r.slugs[name]; exists {
+		if existingID, exists := r.slugs[opts.Name]; exists {
 			existing := r.tunnels[existingID]
 			// If same client owns it and no active connection, reclaim it
-			// (happens on reconnect after server restart)
+			// (happens on reconnect after server restart). Apply the new
+			// options under the existing tunnel's mutex so concurrent
+			// readers see a consistent snapshot.
 			if existing != nil && existing.ClientID == clientID {
 				existing.mu.Lock()
 				hasConn := existing.conn != nil && !existing.closed
-				existing.mu.Unlock()
 				if !hasConn {
-					// Reclaim: update TTL and port, return existing tunnel
+					// Reclaim: update TTL, port, and any provided opts
 					now := time.Now()
-					existing.LocalPort = localPort
+					existing.LocalPort = opts.LocalPort
 					existing.TTL = Duration(ttl)
 					existing.ExpiresAt = now.Add(ttl)
+					if opts.Tier != "" {
+						existing.Tier = opts.Tier
+					}
+					if opts.DeviceName != "" {
+						existing.DeviceName = opts.DeviceName
+					}
+					if opts.Source != "" {
+						existing.Source = opts.Source
+					}
+					existing.IdleTTL = opts.IdleTTL
+					existing.AuthUser = opts.AuthUser
+					existing.AuthPass = opts.AuthPass
+					existing.mu.Unlock()
 					log.Printf("tunnel reclaimed: id=%s slug=%s client=%s",
 						existing.ID, existing.Slug, clientID)
 					return existing, nil
 				}
+				existing.mu.Unlock()
 			}
-			return nil, fmt.Errorf("tunnel name %q already in use", name)
+			return nil, fmt.Errorf("tunnel name %q already in use", opts.Name)
 		}
-		slug = name
+		slug = opts.Name
 	}
 
 	now := time.Now()
 	t := &Tunnel{
-		ID:        uuid.New().String(),
-		Slug:      slug,
-		ClientID:  clientID,
-		LocalPort: localPort,
-		Name:      name,
-		TTL:       Duration(ttl),
-		Mode:      "relay",
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
+		ID:         uuid.New().String(),
+		Slug:       slug,
+		ClientID:   clientID,
+		LocalPort:  opts.LocalPort,
+		Name:       opts.Name,
+		TTL:        Duration(ttl),
+		Mode:       "relay",
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(ttl),
+		Tier:       opts.Tier,
+		DeviceName: opts.DeviceName,
+		Source:     opts.Source,
+		IdleTTL:    opts.IdleTTL,
+		AuthUser:   opts.AuthUser,
+		AuthPass:   opts.AuthPass,
 	}
 
 	r.tunnels[t.ID] = t
@@ -290,6 +333,18 @@ func (r *Registry) Create(clientID string, localPort int, name string, ttl time.
 	r.emit(Event{Type: EventCreated, Tunnel: t})
 
 	return t, nil
+}
+
+// Create is the legacy positional-arg form retained for tests and simple
+// call sites that don't need to set tier/auth metadata. Production code
+// paths should use CreateWithOptions instead — see its docstring for the
+// data-race rationale.
+func (r *Registry) Create(clientID string, localPort int, name string, ttl time.Duration) (*Tunnel, error) {
+	return r.CreateWithOptions(clientID, CreateOptions{
+		LocalPort: localPort,
+		Name:      name,
+		TTL:       ttl,
+	})
 }
 
 // Get returns a tunnel by ID.

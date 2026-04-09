@@ -7,6 +7,7 @@ import (
 	"flag"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,6 +42,7 @@ func main() {
 	adminSecret := flag.String("admin-secret", envOr("NULLBORE_ADMIN_SECRET", ""), "Shared secret for admin API (dashboard→server)")
 	maxTunnels := flag.Int("max-tunnels", envOrInt("NULLBORE_MAX_TUNNELS", 10), "Max tunnels per client (0 = unlimited)")
 	maxBodyMB := flag.Int("max-body-mb", envOrInt("NULLBORE_MAX_BODY_MB", 500), "Max request body size in MB (0 = unlimited)")
+	trustedProxies := flag.String("trusted-proxies", envOr("NULLBORE_TRUSTED_PROXIES", ""), "Comma-separated CIDRs whose X-Forwarded-For headers are honored for client-IP determination. Empty = no proxies trusted (the safe default for direct internet exposure). Set this when running behind a CDN or load balancer.")
 	flag.Parse()
 
 	// Set up structured logging
@@ -87,7 +89,17 @@ func main() {
 		}
 	} else {
 		authProvider = auth.NewStaticProvider(*apiKeys)
-		slog.Info("auth: static keys")
+		if *apiKeys == "" {
+			// Static provider with zero keys accepts ANY token as user
+			// "dev". This is fine for `go run` against a fresh checkout
+			// but a footgun in production: forgetting to set --api-keys
+			// makes the entire tunnel API anonymous-writable. Be loud
+			// about it on every startup so misconfiguration can't be
+			// quietly missed in deployment logs.
+			slog.Warn("auth: STATIC DEV MODE — no API keys configured, all requests authenticated as user 'dev'. Set --api-keys, or --webhook-target+--webhook-secret for remote auth, before exposing this server to the internet.")
+		} else {
+			slog.Info("auth: static keys")
+		}
 	}
 
 	// Initialize tunnel registry
@@ -221,6 +233,32 @@ func main() {
 		slog.Info("account subdomain resolver configured")
 	}
 
+	// Validate that --account-domain is paired with the dashboard webhook
+	// flags that build the resolver. Without the resolver, every
+	// *.{account}.{domain} host returns 404 silently — a confusing
+	// misconfiguration that's much better caught at startup than in prod.
+	if *accountDomain != "" && subdomainResolver == nil {
+		log.Fatalf("--account-domain=%q requires --webhook-target and --webhook-secret to enable the account subdomain resolver; without it, all *.{account}.%s requests would 404 silently", *accountDomain, *accountDomain)
+	}
+
+	// Parse trusted proxies CIDR list. Empty list = X-Forwarded-For
+	// ignored entirely (the secure default for direct internet exposure).
+	var trustedProxyCIDRs []*net.IPNet
+	if *trustedProxies != "" {
+		for _, raw := range strings.Split(*trustedProxies, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			_, n, err := net.ParseCIDR(raw)
+			if err != nil {
+				log.Fatalf("--trusted-proxies: invalid CIDR %q: %v", raw, err)
+			}
+			trustedProxyCIDRs = append(trustedProxyCIDRs, n)
+		}
+		slog.Info("trusted proxies configured", "count", len(trustedProxyCIDRs), "cidrs", *trustedProxies)
+	}
+
 	tlsCfg := &api.TLSConfig{
 		CertFile:       *tlsCert,
 		KeyFile:        *tlsKey,
@@ -249,6 +287,7 @@ func main() {
 		SubdomainResolver: subdomainResolver,
 		IPChecker:         remoteProvider, // nil if no remote auth configured
 		MaxBodyBytes:      int64(*maxBodyMB) * 1024 * 1024,
+		TrustedProxies:    trustedProxyCIDRs,
 	}
 
 	if *baseDomain != "" {

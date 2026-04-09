@@ -439,3 +439,248 @@ func TestAccountSubdomainRouting404s(t *testing.T) {
 	}
 }
 
+// stubIPChecker returns a fixed allowlist for any user.
+type stubIPChecker struct{ allowlist []string }
+
+func (s *stubIPChecker) GetIPAllowlistForUser(userID string) []string {
+	return s.allowlist
+}
+
+// TestClientIP_TrustedProxyHonorsXFF verifies that X-Forwarded-For is
+// honored ONLY when the immediate peer matches a configured TrustedProxies
+// CIDR. Without TrustedProxies, X-F-F is ignored entirely — the safe
+// default. This is the regression test for the IP-allowlist bypass bug.
+func TestClientIP_TrustedProxyHonorsXFF(t *testing.T) {
+	_, trustedNet, _ := net.ParseCIDR("10.0.0.0/8")
+
+	cases := []struct {
+		name           string
+		trusted        []*net.IPNet
+		remoteAddr     string
+		xff            string
+		wantClientIP   string
+		wantAllowed    bool
+		allowlist      []string
+	}{
+		{
+			name:         "no trusted proxies → XFF ignored, peer used",
+			trusted:      nil,
+			remoteAddr:   "203.0.113.5:54321",
+			xff:          "1.2.3.4",
+			wantClientIP: "203.0.113.5",
+		},
+		{
+			name:         "peer not in trusted list → XFF ignored",
+			trusted:      []*net.IPNet{trustedNet},
+			remoteAddr:   "203.0.113.5:54321",
+			xff:          "1.2.3.4",
+			wantClientIP: "203.0.113.5",
+		},
+		{
+			name:         "peer in trusted list → XFF leftmost honored",
+			trusted:      []*net.IPNet{trustedNet},
+			remoteAddr:   "10.0.0.7:34123",
+			xff:          "1.2.3.4, 10.0.0.7",
+			wantClientIP: "1.2.3.4",
+		},
+		{
+			name:         "peer in trusted list, no XFF → peer used",
+			trusted:      []*net.IPNet{trustedNet},
+			remoteAddr:   "10.0.0.7:34123",
+			wantClientIP: "10.0.0.7",
+		},
+		{
+			name:         "peer in trusted list, empty XFF → peer used",
+			trusted:      []*net.IPNet{trustedNet},
+			remoteAddr:   "10.0.0.7:34123",
+			xff:          "",
+			wantClientIP: "10.0.0.7",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewServer(Config{
+				TrustedProxies: tc.trusted,
+				Auth:           auth.NewStaticProvider(""),
+				Registry:       tunnel.NewRegistry(),
+			})
+			req, _ := http.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			got := srv.clientIP(req)
+			if got != tc.wantClientIP {
+				t.Errorf("clientIP = %q, want %q", got, tc.wantClientIP)
+			}
+		})
+	}
+}
+
+// TestClientIP_AllowlistBypassPrevention is the end-to-end version of the
+// bug: a malicious caller spoofs X-Forwarded-For to make their request
+// appear to come from an allowlisted IP. With TrustedProxies empty (the
+// safe default) the spoof must be ignored.
+func TestClientIP_AllowlistBypassPrevention(t *testing.T) {
+	srv := NewServer(Config{
+		// Note: NO TrustedProxies. The internet-facing peer's X-F-F
+		// header must NOT be honored.
+		Auth:     auth.NewStaticProvider(""),
+		Registry: tunnel.NewRegistry(),
+	})
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "198.51.100.99:12345" // attacker
+	req.Header.Set("X-Forwarded-For", "10.0.0.1") // claims to be the allowlisted internal IP
+	got := srv.clientIP(req)
+	if got != "198.51.100.99" {
+		t.Errorf("untrusted peer's spoofed X-F-F was honored: clientIP = %q, want 198.51.100.99", got)
+	}
+	// And confirm the allowlist enforcement actually rejects the attacker
+	allowed := checkIPAllowed(got, []string{"10.0.0.0/8"})
+	if allowed {
+		t.Error("attacker bypassed IP allowlist via X-Forwarded-For spoofing")
+	}
+}
+
+// TestSuspendTunnelInvalidJSON verifies that handleSuspendTunnel returns
+// 400 on malformed JSON instead of silently treating it as suspended=false.
+// Regression test for the silently-swallowed decode bug.
+func TestSuspendTunnelInvalidJSON(t *testing.T) {
+	authProvider := auth.NewStaticProvider("nbk_default_secret")
+	registry := tunnel.NewRegistry()
+	srv := NewServer(Config{Auth: authProvider, Registry: registry})
+
+	// Create a tunnel for the static "default" client
+	tun, err := registry.CreateWithOptions("default", tunnel.CreateOptions{
+		LocalPort: 8080,
+		TTL:       time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(authProvider.Middleware(srv.mux))
+	defer ts.Close()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels/"+tun.ID+"/suspend",
+		strings.NewReader("{not valid json"))
+	req.Header.Set("Authorization", "Bearer nbk_default_secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("malformed JSON: got %d, want 400 (body=%s)", resp.StatusCode, string(body))
+	}
+
+	// And confirm the tunnel was NOT suspended (i.e. the decode failure
+	// did not silently fall through to a state change)
+	if tun.Suspended {
+		t.Error("malformed JSON suspend request silently mutated state")
+	}
+}
+
+// TestRequestIDMiddleware_GeneratesAndPropagates verifies that every
+// response carries an X-Request-ID header, that an inbound ID is preserved
+// when sane, and that an oversized inbound ID is replaced.
+func TestRequestIDMiddleware_GeneratesAndPropagates(t *testing.T) {
+	var observedID string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedID = RequestIDFrom(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := RequestIDMiddleware(inner)
+
+	// Case 1: no inbound ID → middleware generates one
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	handler.ServeHTTP(w, r)
+	gen := w.Header().Get("X-Request-ID")
+	if gen == "" || len(gen) != 16 {
+		t.Errorf("generated id wrong shape: %q", gen)
+	}
+	if observedID != gen {
+		t.Errorf("context id %q != response header id %q", observedID, gen)
+	}
+
+	// Case 2: sane inbound ID → preserved
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Request-ID", "trace-abc-123")
+	handler.ServeHTTP(w, r)
+	if got := w.Header().Get("X-Request-ID"); got != "trace-abc-123" {
+		t.Errorf("inbound id not preserved: got %q", got)
+	}
+
+	// Case 3: oversized inbound ID → replaced (anti-log-injection / memory abuse)
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Request-ID", strings.Repeat("a", 1024))
+	handler.ServeHTTP(w, r)
+	if got := w.Header().Get("X-Request-ID"); len(got) != 16 {
+		t.Errorf("oversized id should be replaced with generated, got len=%d", len(got))
+	}
+
+	// Case 4: control-character inbound ID → replaced
+	w = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("X-Request-ID", "evil\nlog\tinjection")
+	handler.ServeHTTP(w, r)
+	if got := w.Header().Get("X-Request-ID"); len(got) != 16 {
+		t.Errorf("control-char id should be replaced with generated, got %q", got)
+	}
+}
+
+// TestCreateWithOptionsAtomicPublication is the regression test for the
+// data race: it verifies that all fields set via CreateOptions are
+// readable by the time the tunnel is in the slug map. The race detector
+// in `make test-race` is what would catch concurrent racing access; this
+// test pins the contract.
+func TestCreateWithOptionsAtomicPublication(t *testing.T) {
+	r := tunnel.NewRegistry()
+	opts := tunnel.CreateOptions{
+		LocalPort:  8080,
+		Name:       "myapp",
+		TTL:        time.Hour,
+		Tier:       "pro",
+		DeviceName: "macbook",
+		Source:     "cli",
+		IdleTTL:    true,
+		AuthUser:   "alice",
+		AuthPass:   "s3cret",
+	}
+	tun, err := r.CreateWithOptions("user-1", opts)
+	if err != nil {
+		t.Fatalf("CreateWithOptions: %v", err)
+	}
+
+	// Look up by slug — this is exactly the path the proxy handler uses,
+	// and it must observe all the fields set above.
+	got, ok := r.GetBySlug("myapp")
+	if !ok {
+		t.Fatal("tunnel not findable by slug after CreateWithOptions")
+	}
+	if got.Tier != "pro" {
+		t.Errorf("Tier: got %q want pro", got.Tier)
+	}
+	if got.DeviceName != "macbook" {
+		t.Errorf("DeviceName: got %q want macbook", got.DeviceName)
+	}
+	if got.Source != "cli" {
+		t.Errorf("Source: got %q want cli", got.Source)
+	}
+	if !got.IdleTTL {
+		t.Error("IdleTTL: got false want true")
+	}
+	if got.AuthUser != "alice" || got.AuthPass != "s3cret" {
+		t.Errorf("AuthUser/Pass: got %q/%q want alice/s3cret", got.AuthUser, got.AuthPass)
+	}
+	if got.ID != tun.ID {
+		t.Errorf("ID mismatch: registry=%q created=%q", got.ID, tun.ID)
+	}
+}

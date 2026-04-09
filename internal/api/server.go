@@ -49,6 +49,14 @@ type Config struct {
 	SubdomainResolver *SubdomainResolver // account subdomain → user ID resolver (optional)
 	IPChecker         IPCheckerProvider  // optional; nil means allow all IPs
 	MaxBodyBytes      int64              // max request body size (0 = unlimited, default 500MB)
+
+	// TrustedProxies is the set of CIDRs whose `X-Forwarded-For` headers
+	// will be honored for client-IP determination (used by IP allowlists,
+	// rate limits, and request logs). When the immediate peer
+	// (r.RemoteAddr) is NOT in this list, X-F-F is ignored and r.RemoteAddr
+	// is used. Empty (the default) means no proxies are trusted, which is
+	// the safe stance for a server exposed directly to the internet.
+	TrustedProxies []*net.IPNet
 }
 
 // Server is the main HTTP server.
@@ -228,14 +236,10 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		return
 	}
 
-	// IP allowlist check
+	// IP allowlist check — uses TrustedProxy-gated client IP
 	if s.cfg.IPChecker != nil {
-		clientIP := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			clientIP = strings.TrimSpace(strings.Split(fwd, ",")[0])
-		}
 		allowlist := s.cfg.IPChecker.GetIPAllowlistForUser(t.ClientID)
-		if !checkIPAllowed(clientIP, allowlist) {
+		if !checkIPAllowed(s.clientIP(r), allowlist) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusForbidden)
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
@@ -342,8 +346,11 @@ func reconstructSubdomainRequest(r *http.Request, slug string) []byte {
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%s", s.cfg.Host, s.cfg.Port)
 
-	// Wrap with subdomain handler, then logging middleware
-	handler := LoggingMiddleware(s.subdomainHandler(s.mux))
+	// Wrap with: request ID → logging → subdomain routing → mux.
+	// Request ID must be outermost so the logging middleware sees it for
+	// every request, and so the X-Request-ID response header is set even
+	// on early-return paths inside the subdomain handler.
+	handler := RequestIDMiddleware(LoggingMiddleware(s.subdomainHandler(s.mux)))
 
 	// Wrap handler to inject version headers on all responses
 	versionHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -639,31 +646,33 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	t, err := s.cfg.Registry.Create(clientID, req.LocalPort, req.Name, ttl)
+	// Build creation options. All fields are applied atomically inside
+	// CreateWithOptions before the tunnel is published into the slug map,
+	// so concurrent proxy requests can never race on Tier/AuthUser/etc.
+	opts := tunnel.CreateOptions{
+		LocalPort:  req.LocalPort,
+		Name:       req.Name,
+		TTL:        ttl,
+		Tier:       tier,
+		IdleTTL:    req.IdleTTL,
+		Source:     req.Source,
+		DeviceName: req.DeviceName,
+	}
+	if opts.AuthUser == "" && req.AuthUser != "" && req.AuthPass != "" {
+		opts.AuthUser = req.AuthUser
+		opts.AuthPass = req.AuthPass
+	}
+	// Device identity — prefer request body, fall back to header
+	if opts.DeviceName == "" {
+		if h := r.Header.Get("X-NullBore-Device-Hostname"); h != "" {
+			opts.DeviceName = h
+		}
+	}
+
+	t, err := s.cfg.Registry.CreateWithOptions(clientID, opts)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
-	}
-
-	// Tag tunnel with owner's tier for per-request enforcement (body limits, etc.)
-	t.Tier = tier
-	if req.AuthUser != "" && req.AuthPass != "" {
-		t.AuthUser = req.AuthUser
-		t.AuthPass = req.AuthPass
-	}
-
-	if req.IdleTTL {
-		t.IdleTTL = true
-	}
-
-	// Device identity — prefer request body, fall back to header
-	if req.DeviceName != "" {
-		t.DeviceName = req.DeviceName
-	} else if h := r.Header.Get("X-NullBore-Device-Hostname"); h != "" {
-		t.DeviceName = h
-	}
-	if req.Source != "" {
-		t.Source = req.Source
 	}
 
 	// Persist to store
@@ -764,7 +773,10 @@ func (s *Server) handleSuspendTunnel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Suspended bool `json:"suspended"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
 
 	if err := s.cfg.Registry.SetSuspended(id, req.Suspended); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -875,14 +887,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IP allowlist check
+	// IP allowlist check — uses TrustedProxy-gated client IP
 	if s.cfg.IPChecker != nil {
-		clientIP := r.RemoteAddr
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			clientIP = strings.TrimSpace(strings.Split(fwd, ",")[0])
-		}
 		allowlist := s.cfg.IPChecker.GetIPAllowlistForUser(t.ClientID)
-		if !checkIPAllowed(clientIP, allowlist) {
+		if !checkIPAllowed(s.clientIP(r), allowlist) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusForbidden)
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Access Denied</title><style>body{font-family:system-ui;background:#1a1a2e;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}div{text-align:center;max-width:400px;padding:2rem}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.3rem;margin:0.5rem 0}p{color:#888;font-size:0.9rem}a{color:#6366f1}</style></head><body><div><div class="icon">🚫</div><h1>Access Denied</h1><p>Your IP address is not permitted to access this tunnel.</p><p style="margin-top:1.5rem;font-size:0.8rem;"><a href="https://nullbore.com">Powered by NullBore</a></p></div></body></html>`)
@@ -1024,7 +1032,9 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.AdminSecret == "" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API not configured"})
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "admin API not configured — start the server with --admin-secret or set NULLBORE_ADMIN_SECRET",
+			})
 			return
 		}
 		secret := r.Header.Get("X-Admin-Secret")
@@ -1034,6 +1044,12 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			if len(auth) > 7 && auth[:7] == "Bearer " {
 				secret = auth[7:]
 			}
+		}
+		if secret == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error": "missing admin secret — pass it via X-Admin-Secret header or Authorization: Bearer <secret>",
+			})
+			return
 		}
 		if subtle.ConstantTimeCompare([]byte(secret), []byte(s.cfg.AdminSecret)) != 1 {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid admin secret"})
@@ -1102,7 +1118,10 @@ func (s *Server) handleAdminSuspendTunnel(w http.ResponseWriter, r *http.Request
 	var req struct {
 		Suspended bool `json:"suspended"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
 
 	if err := s.cfg.Registry.SetSuspended(id, req.Suspended); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -1232,13 +1251,8 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
 		path += "?" + r.URL.RawQuery
 	}
 
-	remoteIP := r.RemoteAddr
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		remoteIP = strings.Split(fwd, ",")[0]
-	}
-
 	if s.cfg.Events != nil {
-		s.cfg.Events.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, remoteIP)
+		s.cfg.Events.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, s.clientIP(r))
 	}
 }
 
@@ -1260,6 +1274,41 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("json encode error: %v", err)
 	}
+}
+
+// clientIP returns the originating client IP for a request, honoring
+// X-Forwarded-For ONLY when the immediate peer is in TrustedProxies.
+//
+// Without this gating, anyone on the internet can spoof X-Forwarded-For
+// to bypass per-tunnel IP allowlists or pollute request logs. By default
+// TrustedProxies is empty, so X-F-F is ignored entirely — the safe stance
+// for a server fronted by nothing or by ACME on its own listener. Set the
+// flag in front-of-CDN deployments.
+func (s *Server) clientIP(r *http.Request) string {
+	peer := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(peer); err == nil {
+		peer = h
+	}
+	if len(s.cfg.TrustedProxies) > 0 {
+		if ip := net.ParseIP(peer); ip != nil && ipInCIDRs(ip, s.cfg.TrustedProxies) {
+			if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+				// Use the leftmost address (the original client per RFC 7239 §5.2)
+				if first := strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0]); first != "" {
+					return first
+				}
+			}
+		}
+	}
+	return peer
+}
+
+func ipInCIDRs(ip net.IP, cidrs []*net.IPNet) bool {
+	for _, n := range cidrs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkIPAllowed checks if the given remote address is permitted by the CIDR allowlist.
