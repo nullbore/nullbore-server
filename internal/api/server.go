@@ -291,7 +291,7 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 
 	if err := s.wsHub.RelayConn(t.ID, conn, reqPrefix); err != nil {
 		log.Printf("relay error: tunnel=%s err=%v", t.ID, err)
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 24\r\n\r\ntunnel client unavailable"))
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 25\r\n\r\ntunnel client unavailable"))
 		conn.Close()
 		return
 	}
@@ -973,7 +973,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Hand the raw connection to the hub for relay
 	if err := s.wsHub.RelayConn(t.ID, conn, reqPrefix); err != nil {
 		log.Printf("relay error: tunnel=%s err=%v", t.ID, err)
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 24\r\n\r\ntunnel client unavailable"))
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 25\r\n\r\ntunnel client unavailable"))
 		conn.Close()
 		return
 	}
