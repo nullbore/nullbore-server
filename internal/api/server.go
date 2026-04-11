@@ -492,7 +492,11 @@ func (s *Server) checkTunnelAuth(w http.ResponseWriter, r *http.Request, t *tunn
 		return true // no auth configured
 	}
 	user, pass, ok := r.BasicAuth()
-	if !ok || user != t.AuthUser || pass != t.AuthPass {
+	// Use constant-time comparison to prevent timing attacks that could
+	// leak the username or password length/content byte-by-byte.
+	userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(t.AuthUser)) == 1
+	passMatch := subtle.ConstantTimeCompare([]byte(pass), []byte(t.AuthPass)) == 1
+	if !ok || !userMatch || !passMatch {
 		w.Header().Set("WWW-Authenticate", `Basic realm="NullBore Tunnel"`)
 		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
 		return false
