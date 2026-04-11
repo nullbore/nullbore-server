@@ -5,6 +5,7 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:  # allows manual trigger for key sync / emergency deploy
 
 concurrency:
   group: deploy-prod
@@ -15,7 +16,7 @@ permissions:
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main') }}
     runs-on: ubuntu-latest
 
     steps:
@@ -52,6 +53,34 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
           ssh-keyscan -p "${PROD_PORT:-22}" -H "$PROD_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync SSH authorized keys
+        env:
+          PROD_HOST: ${{ secrets.NB_PROD_HOST }}
+          PROD_USER: ${{ secrets.NB_PROD_USER }}
+          PROD_PORT: ${{ secrets.NB_PROD_PORT }}
+        run: |
+          set -euo pipefail
+          : "${PROD_HOST:?}" ; : "${PROD_USER:?}"
+
+          # Upload the canonical key list from the repo and merge with
+          # whatever is already in authorized_keys (preserving the deploy
+          # key and any manually-added keys). Dedup with sort -u so
+          # repeated deploys don't bloat the file.
+          scp -P "${PROD_PORT:-22}" .github/authorized-keys \
+            "$PROD_USER@$PROD_HOST:/tmp/nb-authorized-keys"
+
+          ssh -p "${PROD_PORT:-22}" "$PROD_USER@$PROD_HOST" <<'KEYSEOF'
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          touch ~/.ssh/authorized_keys
+          # Strip comments + blank lines from the repo file, merge, dedup
+          grep -v '^#' /tmp/nb-authorized-keys | grep -v '^$' >> ~/.ssh/authorized_keys
+          sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "authorized_keys: $(wc -l < ~/.ssh/authorized_keys) keys"
+          rm /tmp/nb-authorized-keys
+          KEYSEOF
 
       - name: Deploy to tunnel server
         env:

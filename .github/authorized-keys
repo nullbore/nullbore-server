@@ -1,0 +1,19 @@
+# NullBore production SSH authorized keys.
+#
+# These keys are synced to /root/.ssh/authorized_keys on every deploy
+# via the "Sync SSH keys" step in deploy-prod.yml. To grant SSH access
+# to a new operator, add their public key here and push — the next
+# deploy applies it automatically.
+#
+# The deploy workflow's own key (NB_PROD_SSH_KEY GitHub secret) is
+# already in authorized_keys from droplet creation and is NOT listed
+# here — it's managed separately via GitHub secrets.
+
+# PJ (project owner) — pj@tank
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDqkCWy+fVhu907GDkaNUMJsQ8NhhzxZnpCtsC01pg9B pj@tank
+
+# Mole (OpenClaw agent) — mole-20260404
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9Fecdd2h3gas781WmxDCoa0u7tGWGhmU9/W/19UgH0 node@9ccce14fecb0
+
+# Mole (older key) — mole-agent-1775124662
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOcP4lAyT/iu2C0UH1WU+ZMAnMZbpTVyyoHOLHUQOmMX node@2b2a92335f37
