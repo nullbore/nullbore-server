@@ -9,7 +9,7 @@ import (
 
 // Tier represents a subscription tier with its limits.
 type Tier struct {
-	Name           string `json:"name"` // free, hobby, pro
+	Name           string `json:"name"` // free, dev, pro
 	MaxTunnels     int    `json:"max_tunnels"`
 	MaxTTLHours    int    `json:"max_ttl_hours"`
 	MonthlyBandwidth int64 `json:"monthly_bandwidth_bytes"`
@@ -25,14 +25,14 @@ var (
 		MonthlyBandwidth: 2 * 1024 * 1024 * 1024, // 2 GB
 		Webhooks: false, CustomDomains: false, MaxAPIKeys: 1,
 	}
-	TierHobby = Tier{
-		Name: "hobby", MaxTunnels: 3, MaxTTLHours: 8,
-		MonthlyBandwidth: 25 * 1024 * 1024 * 1024, // 25 GB
-		Webhooks: true, CustomDomains: false, MaxAPIKeys: 3,
+	TierDev = Tier{
+		Name: "dev", MaxTunnels: 5, MaxTTLHours: 0, // 0 = persistent
+		MonthlyBandwidth: 50 * 1024 * 1024 * 1024, // 50 GB
+		Webhooks: true, CustomDomains: false, MaxAPIKeys: 5,
 	}
 	TierPro = Tier{
-		Name: "pro", MaxTunnels: 10, MaxTTLHours: 24,
-		MonthlyBandwidth: 100 * 1024 * 1024 * 1024, // 100 GB
+		Name: "pro", MaxTunnels: 20, MaxTTLHours: 0, // 0 = persistent
+		MonthlyBandwidth: 200 * 1024 * 1024 * 1024, // 200 GB
 		Webhooks: true, CustomDomains: true, MaxAPIKeys: 10,
 	}
 )
@@ -170,8 +170,8 @@ func HostedHandler(cfg HostedConfig) http.Handler {
 // TierFor returns the tier for a given plan name.
 func TierFor(name string) Tier {
 	switch name {
-	case "hobby":
-		return TierHobby
+	case "dev":
+		return TierDev
 	case "pro":
 		return TierPro
 	default:

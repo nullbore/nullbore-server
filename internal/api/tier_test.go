@@ -15,9 +15,10 @@ func TestTierTunnelLimit(t *testing.T) {
 		expected int
 	}{
 		{"free", 1},
-		{"hobby", 5},
+		{"dev", 5},
 		{"pro", 20},
-		{"", 1},
+		{"", 1},       // unknown defaults to free
+		{"hobby", 1},  // legacy tier name defaults to free
 	}
 	for _, tt := range tests {
 		got := tierTunnelLimit(tt.tier)
@@ -33,7 +34,7 @@ func TestTierMaxBodyBytes(t *testing.T) {
 		expected int64
 	}{
 		{"free", 25 * 1024 * 1024},
-		{"hobby", 100 * 1024 * 1024},
+		{"dev", 100 * 1024 * 1024},
 		{"pro", 500 * 1024 * 1024},
 		{"", 25 * 1024 * 1024},
 	}
@@ -51,8 +52,8 @@ func TestTierMaxTTL(t *testing.T) {
 		expected time.Duration
 	}{
 		{"free", 2 * time.Hour},
-		{"hobby", 7 * 24 * time.Hour},
-		{"pro", 0},
+		{"dev", 0},   // persistent
+		{"pro", 0},   // persistent
 		{"", 2 * time.Hour},
 	}
 	for _, tt := range tests {
@@ -152,6 +153,26 @@ func TestTTLCapEnforcement(t *testing.T) {
 	}
 	if ttl > 2*time.Hour {
 		t.Errorf("ttl = %v, want <= 2h (free tier cap)", ttl)
+	}
+}
+
+func TestIdleTTLGatingFree(t *testing.T) {
+	// Static auth (no tier) = free → idle_ttl should be rejected
+	_, ts := newTestServer("nbk_test_secret")
+	defer ts.Close()
+
+	body := `{"local_port":3000,"ttl":"1h","idle_ttl":true}`
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer nbk_test_secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create tunnel failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 403 {
+		t.Errorf("idle_ttl on free tier: status = %d, want 403", resp.StatusCode)
 	}
 }
 

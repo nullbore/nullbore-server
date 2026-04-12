@@ -80,9 +80,9 @@ func NewServer(cfg Config) *Server {
 		// Per-tunnel proxy rate limiters by tier.
 		// Use per-second refill intervals to avoid minute-boundary starvation.
 		proxyLimiters: map[string]*RateLimiter{
-			"free":  NewRateLimiter(10, time.Second, 60),      // moderate guardrail for abuse
-			"hobby": NewRateLimiter(1000, time.Second, 2000),  // effectively unbounded for normal web traffic
-			"pro":   NewRateLimiter(10000, time.Second, 10000), // practically unlimited
+			"free": NewRateLimiter(10, time.Second, 60),       // moderate guardrail for abuse
+			"dev":  NewRateLimiter(1000, time.Second, 2000),   // effectively unbounded for normal web traffic
+			"pro":  NewRateLimiter(10000, time.Second, 10000), // practically unlimited
 		},
 	}
 	s.routes()
@@ -475,11 +475,9 @@ type createTunnelRequest struct {
 // tierMaxTTL returns the max TTL for a tier.
 func tierMaxTTL(tier string) time.Duration {
 	switch tier {
-	case "pro":
+	case "pro", "dev":
 		return 0 // no limit (persistent)
-	case "hobby":
-		return 7 * 24 * time.Hour // 7 days
-	default: // free
+	default: // free or unknown
 		return 2 * time.Hour
 	}
 }
@@ -525,12 +523,11 @@ func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bo
 }
 
 // tierMaxBodyBytes returns the max request body size for a tier.
-// Scaled to bandwidth allocation: free=25MB, hobby=100MB, pro=500MB.
 func tierMaxBodyBytes(tier string) int64 {
 	switch tier {
 	case "pro":
 		return 500 * 1024 * 1024
-	case "hobby":
+	case "dev":
 		return 100 * 1024 * 1024
 	default: // free
 		return 25 * 1024 * 1024
@@ -542,7 +539,7 @@ func tierTunnelLimit(tier string) int {
 	switch tier {
 	case "pro":
 		return 20
-	case "hobby":
+	case "dev":
 		return 5
 	default: // free or unknown
 		return 1
@@ -624,18 +621,26 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		ttl = parsed
 	}
 
-	// TTL=0 means persistent (pro only)
+	// TTL=0 means persistent (dev and pro only)
 	if ttl == 0 {
-		if tier != "pro" {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "persistent tunnels require Pro tier"})
+		if tier != "pro" && tier != "dev" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "persistent tunnels require a paid plan"})
 			return
 		}
 		ttl = 100 * 365 * 24 * time.Hour // ~100 years
 	}
 
-	// Enforce tier-based TTL cap (0 = no limit for pro)
+	// Enforce tier-based TTL cap (0 = no limit for dev/pro)
 	if maxTTL := tierMaxTTL(tier); maxTTL > 0 && ttl > maxTTL {
 		ttl = maxTTL
+	}
+
+	// Idle TTL (TTL resets on activity) is only available on paid tiers.
+	// Without this gate, free users could keep a 2-hour tunnel alive
+	// indefinitely by sending periodic pings.
+	if req.IdleTTL && tier != "dev" && tier != "pro" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "idle timeout mode requires a paid plan"})
+		return
 	}
 
 	// Bandwidth limit check
