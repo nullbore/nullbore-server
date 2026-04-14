@@ -94,7 +94,7 @@ func HostedHandler(cfg HostedConfig) http.Handler {
 		writeJSON(w, 501, map[string]string{"error": "not implemented"})
 	}))
 
-	// Webhook configuration (Hobby+ tier)
+	// Webhook configuration (Dev+ tier)
 	mux.HandleFunc("GET /dash/api/webhooks", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		// TODO: List configured webhook endpoints
 		writeJSON(w, 501, map[string]string{"error": "not implemented"})

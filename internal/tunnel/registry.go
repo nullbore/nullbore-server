@@ -34,7 +34,7 @@ type Tunnel struct {
 
 	DeviceName string `json:"device_name,omitempty"` // hostname of the connecting device
 	Source     string `json:"source,omitempty"`       // "cli" or "daemon"
-	Tier       string `json:"tier,omitempty"`          // owner's tier at creation time (free/hobby/pro)
+	Tier       string `json:"tier,omitempty"`          // owner's tier at creation time (free/dev/pro)
 	AuthUser   string `json:"-"`                       // basic auth username (not serialized to API)
 	AuthPass   string `json:"-"`                       // basic auth password (not serialized to API)
 
@@ -225,7 +225,7 @@ type CreateOptions struct {
 	LocalPort  int
 	TTL        time.Duration
 	Name       string // user-chosen slug; empty = generated random slug
-	Tier       string // owner's tier (free/hobby/pro)
+	Tier       string // owner's tier (free/dev/pro)
 	DeviceName string
 	Source     string // "cli" or "daemon"
 	IdleTTL    bool

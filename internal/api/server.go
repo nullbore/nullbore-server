@@ -593,7 +593,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isReclaim {
-			// Named tunnels require an account subdomain (Hobby+) or custom domain (Pro).
+			// Named tunnels require an account subdomain (Dev+) or custom domain (Pro).
 			// Without one, names would collide in the global tunnel.nullbore.com namespace.
 			hasNamespace := false
 			if rp := getRemoteProvider(s.cfg.Auth); rp != nil {
@@ -604,7 +604,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 			}
 			if !hasNamespace {
 				writeJSON(w, http.StatusForbidden, map[string]string{
-					"error": "named tunnels require an account subdomain — claim one in your dashboard (Hobby plan and up)",
+					"error": "named tunnels require an account subdomain — claim one in your dashboard (Dev plan and up)",
 				})
 				return
 			}

@@ -11,6 +11,7 @@
 
 # PJ (project owner) — pj@tank
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDqkCWy+fVhu907GDkaNUMJsQ8NhhzxZnpCtsC01pg9B pj@tank
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFS4GjZJG9x0IeXplKJ8om12FCfxSEt0k8h1ATkQjYvE pj@atrium
 
 # Mole (OpenClaw agent) — mole-20260404
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9Fecdd2h3gas781WmxDCoa0u7tGWGhmU9/W/19UgH0 node@9ccce14fecb0
