@@ -32,6 +32,7 @@ type cacheEntry struct {
 	ipAllowlist    []string // CIDRs for IP allowlisting
 	bandwidthUsed  int64
 	bandwidthLimit int64
+	tunnelLimit    int    // 0 = use tier default
 	subdomain      string // account subdomain (empty if none)
 	validAt        time.Time
 	expiresAt      time.Time
@@ -51,6 +52,7 @@ type validateResponse struct {
 	IPAllowlist    []string `json:"ip_allowlist"`
 	BandwidthUsed  int64    `json:"bandwidth_used"`
 	BandwidthLimit int64    `json:"bandwidth_limit"`
+	TunnelLimit    int      `json:"tunnel_limit"`
 	Subdomain      string   `json:"subdomain"`
 }
 
@@ -139,6 +141,7 @@ func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname stri
 		ipAllowlist:    result.IPAllowlist,
 		bandwidthUsed:  result.BandwidthUsed,
 		bandwidthLimit: result.BandwidthLimit,
+		tunnelLimit:    result.TunnelLimit,
 		subdomain:      result.Subdomain,
 		validAt:        time.Now(),
 		expiresAt:      time.Now().Add(cacheTTL),
@@ -190,6 +193,17 @@ func (p *RemoteProvider) GetBandwidthInfo(token string) (int64, int64) {
 		return e.bandwidthUsed, e.bandwidthLimit
 	}
 	return 0, 0
+}
+
+// GetTunnelLimit returns the per-account tunnel limit for a cached token.
+// Returns 0 if not cached or no override set — caller falls back to tier default.
+func (p *RemoteProvider) GetTunnelLimit(token string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.cache[token]; ok {
+		return e.tunnelLimit
+	}
+	return 0
 }
 
 // GetSubdomain returns the account subdomain for a cached token (empty if none).

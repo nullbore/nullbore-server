@@ -555,9 +555,17 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce per-tier tunnel limits
+	// Enforce tunnel limits. Per-account override (sent by the dashboard via
+	// /internal/validate-key) wins over the tier default. Static-auth mode
+	// has no remote provider and falls back to the tier table.
 	tier := auth.TierFrom(r.Context())
 	limit := tierTunnelLimit(tier)
+	if rp := getRemoteProvider(s.cfg.Auth); rp != nil {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if override := rp.GetTunnelLimit(token); override > 0 {
+			limit = override
+		}
+	}
 	current := s.cfg.Registry.CountByClient(clientID)
 	if current >= limit {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{
