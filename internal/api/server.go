@@ -120,6 +120,7 @@ func (s *Server) routes() {
 	api.HandleFunc("POST /v1/tunnels/{id}/suspend", s.handleSuspendTunnel)
 	api.HandleFunc("POST /v1/tunnels/{id}/extend", s.handleExtendTunnel)
 	api.HandleFunc("GET /v1/tunnels/{id}/requests", s.handleListRequests)
+	api.HandleFunc("POST /v1/tunnels/{id}/inspection", s.handleSetInspection)
 
 	s.mux.Handle("/v1/", s.cfg.Auth.Middleware(api))
 
@@ -129,6 +130,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("DELETE /v1/admin/tunnels/{id}", s.handleAdminCloseTunnel)
 	admin.HandleFunc("POST /v1/admin/tunnels/{id}/suspend", s.handleAdminSuspendTunnel)
 	admin.HandleFunc("GET /v1/admin/tunnels/{id}/requests", s.handleAdminListRequests)
+	admin.HandleFunc("POST /v1/admin/tunnels/{id}/inspection", s.handleAdminSetInspection)
 	s.mux.Handle("/v1/admin/", s.adminMiddleware(admin))
 
 	// Dashboard (if enabled)
@@ -272,10 +274,10 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 	}
 	reqPrefix := append(reqBytes, bodyBytes...)
 
-	// Log request for inspection (async, non-blocking). Subdomain-routed
-	// traffic uses r.URL.Path directly — the path is not embedded in a route
-	// segment like the /t/{slug} path-based proxy.
-	if s.cfg.Events != nil {
+	// Log request for inspection (async, non-blocking). Opt-in per tunnel —
+	// no writes unless the owner enabled inspection. Subdomain-routed traffic
+	// uses r.URL.Path directly.
+	if s.cfg.Events != nil && t.InspectionEnabled {
 		logBody := bodyBytes
 		if len(logBody) > 4096 {
 			logBody = logBody[:4096]
@@ -982,9 +984,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	reqPrefix := append(reqBytes, bodyBytes...)
 
-	// Log request for inspection (async, non-blocking)
-	if s.cfg.Store != nil {
-		// Cap body passed to log (log only needs first 4KB snippet)
+	// Log request for inspection (async, non-blocking). Opt-in per tunnel.
+	if s.cfg.Store != nil && t.InspectionEnabled {
 		logBody := bodyBytes
 		if len(logBody) > 4096 {
 			logBody = logBody[:4096]
@@ -1196,6 +1197,75 @@ func (s *Server) handleAdminSuspendTunnel(w http.ResponseWriter, r *http.Request
 		s.cfg.Events.LogEvent(id, "", state, "via admin API")
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": state})
+}
+
+// handleSetInspection toggles inspection logging for a tunnel owned by the
+// caller. Dev+ only — matches the visibility of /v1/tunnels/{id}/requests.
+func (s *Server) handleSetInspection(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	clientID := auth.ClientIDFrom(r.Context())
+
+	t, ok := s.cfg.Registry.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.ClientID != clientID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not your tunnel"})
+		return
+	}
+	switch auth.TierFrom(r.Context()) {
+	case "dev", "pro":
+		// allowed
+	default:
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires the Dev plan or higher"})
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := s.cfg.Registry.SetInspectionEnabled(id, req.Enabled); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.cfg.Events != nil {
+		state := "inspection-disabled"
+		if req.Enabled {
+			state = "inspection-enabled"
+		}
+		s.cfg.Events.LogEvent(id, clientID, state, "via user API")
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"inspection_enabled": req.Enabled})
+}
+
+// handleAdminSetInspection is the admin-secret variant used by the dashboard
+// when proxying the toggle from the user-facing UI.
+func (s *Server) handleAdminSetInspection(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := s.cfg.Registry.SetInspectionEnabled(id, req.Enabled); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if s.cfg.Events != nil {
+		state := "inspection-disabled"
+		if req.Enabled {
+			state = "inspection-enabled"
+		}
+		s.cfg.Events.LogEvent(id, "", state, "via admin API")
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"inspection_enabled": req.Enabled})
 }
 
 // handleAdminListRequests returns the request inspection log for any tunnel by ID.

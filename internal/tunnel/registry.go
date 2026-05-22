@@ -32,6 +32,11 @@ type Tunnel struct {
 
 	Suspended bool `json:"suspended,omitempty"` // If true, proxy returns suspended page
 
+	// InspectionEnabled gates request_log writes for this tunnel. Default is
+	// false — we advertise "no log by default" and only record per-request
+	// metadata when the tunnel owner explicitly opts in for diagnostics.
+	InspectionEnabled bool `json:"inspection_enabled,omitempty"`
+
 	DeviceName string `json:"device_name,omitempty"` // hostname of the connecting device
 	Source     string `json:"source,omitempty"`       // "cli" or "daemon"
 	Tier       string `json:"tier,omitempty"`          // owner's tier at creation time (free/dev/pro)
@@ -432,6 +437,28 @@ func (r *Registry) SetSuspended(id string, suspended bool) error {
 	state := "resumed"
 	if suspended {
 		state = "suspended"
+	}
+	log.Printf("tunnel %s: id=%s slug=%s", state, t.ID, t.Slug)
+	return nil
+}
+
+// SetInspectionEnabled toggles request_log writes for a tunnel. Opt-in by
+// design: we advertise "no log by default" and only record per-request
+// metadata when the tunnel owner enables this.
+func (r *Registry) SetInspectionEnabled(id string, enabled bool) error {
+	r.mu.RLock()
+	t, ok := r.tunnels[id]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("tunnel %s not found", id)
+	}
+	t.mu.Lock()
+	t.InspectionEnabled = enabled
+	t.mu.Unlock()
+
+	state := "inspection-disabled"
+	if enabled {
+		state = "inspection-enabled"
 	}
 	log.Printf("tunnel %s: id=%s slug=%s", state, t.ID, t.Slug)
 	return nil
