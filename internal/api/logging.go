@@ -91,7 +91,10 @@ func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
 
-// LoggingMiddleware logs HTTP requests with method, path, status, duration, and size.
+// LoggingMiddleware logs HTTP requests with method, path, status, duration, size.
+// Operator-side journal log (systemd / stdout) — separate from the per-tunnel
+// opt-in Request Inspection feature. Includes source IP / UA / Referer for
+// incident response (abuse, support escalation, post-incident forensics).
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -121,6 +124,32 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		}
 		if r.URL.RawQuery != "" {
 			attrs = append(attrs, slog.String("query", r.URL.RawQuery))
+		}
+		// Peer IP — TrustedProxies-aware extraction lives on Server.clientIP,
+		// but this middleware doesn't have a handle to *Server. Fall back to
+		// RemoteAddr (host:port stripped). Hosts behind Cloudflare get the
+		// CF edge IP here; the dedicated per-tunnel inspector resolves the
+		// real client IP via TrustedProxies and stores it in request_log.
+		peer := r.RemoteAddr
+		if i := len(peer) - 1; i >= 0 {
+			for j := i; j >= 0; j-- {
+				if peer[j] == ':' {
+					peer = peer[:j]
+					break
+				}
+			}
+		}
+		if peer != "" {
+			attrs = append(attrs, slog.String("peer_ip", peer))
+		}
+		if ua := r.Header.Get("User-Agent"); ua != "" {
+			attrs = append(attrs, slog.String("ua", ua))
+		}
+		if ref := r.Header.Get("Referer"); ref != "" {
+			attrs = append(attrs, slog.String("referer", ref))
+		}
+		if host := r.Host; host != "" {
+			attrs = append(attrs, slog.String("host", host))
 		}
 
 		level := slog.LevelInfo
