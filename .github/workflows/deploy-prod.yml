@@ -42,28 +42,28 @@ jobs:
       - name: Start SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.NB_TUNNEL_SSH_KEY }}
+          ssh-private-key: ${{ secrets.NB_PROD_SSH_KEY }}
 
       - name: Add host key
         env:
-          TUNNEL_HOST: ${{ secrets.NB_TUNNEL_HOST }}
+          PROD_HOST: ${{ secrets.NB_PROD_HOST }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          ssh-keyscan -H "$TUNNEL_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$PROD_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy server binary
         env:
-          TUNNEL_HOST: ${{ secrets.NB_TUNNEL_HOST }}
-          TUNNEL_USER: ${{ secrets.NB_TUNNEL_USER }}
+          PROD_HOST: ${{ secrets.NB_PROD_HOST }}
+          PROD_USER: ${{ secrets.NB_PROD_USER }}
         run: |
           set -euo pipefail
-          : "${TUNNEL_HOST:?}" ; : "${TUNNEL_USER:?}"
+          : "${PROD_HOST:?}" ; : "${PROD_USER:?}"
 
           scp ./nullbore-server \
-            "$TUNNEL_USER@$TUNNEL_HOST:/usr/local/bin/nullbore-server.new"
+            "$PROD_USER@$PROD_HOST:/usr/local/bin/nullbore-server.new"
 
-          ssh "$TUNNEL_USER@$TUNNEL_HOST" <<'EOF'
+          ssh "$PROD_USER@$PROD_HOST" <<'EOF'
           set -euo pipefail
           chmod +x /usr/local/bin/nullbore-server.new
           mv /usr/local/bin/nullbore-server.new /usr/local/bin/nullbore-server
@@ -73,7 +73,7 @@ jobs:
           EOF
 
           # Health check
-          HEALTH_URL="${TUNNEL_HEALTH_URL:-https://tunnel.nullbore.com/health}"
+          HEALTH_URL="${PROD_HEALTH_URL:-https://tunnel.nullbore.com/health}"
           curl -fsS "$HEALTH_URL" || echo "::warning::Health check failed (may need manual verification)"
 
       - name: Deploy summary
