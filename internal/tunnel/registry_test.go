@@ -480,3 +480,38 @@ func TestRestore(t *testing.T) {
 		t.Errorf("expected 1 tunnel for user-1, got %d", r.CountByClient("user-1"))
 	}
 }
+
+// TestSetInspectionEnabled verifies the toggle the request inspection
+// feature reads on every relay call. Default must be off (we advertise
+// "no log by default"); toggling must round-trip; unknown id is an error.
+func TestSetInspectionEnabled(t *testing.T) {
+	r := NewRegistry()
+	tun, err := r.Create("client1", 8080, "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tun.InspectionEnabled {
+		t.Fatal("InspectionEnabled must default to false")
+	}
+
+	if err := r.SetInspectionEnabled(tun.ID, true); err != nil {
+		t.Fatalf("SetInspectionEnabled(true): %v", err)
+	}
+	got, _ := r.Get(tun.ID)
+	if !got.InspectionEnabled {
+		t.Fatal("flag did not flip to true")
+	}
+
+	if err := r.SetInspectionEnabled(tun.ID, false); err != nil {
+		t.Fatalf("SetInspectionEnabled(false): %v", err)
+	}
+	got, _ = r.Get(tun.ID)
+	if got.InspectionEnabled {
+		t.Fatal("flag did not flip back to false")
+	}
+
+	if err := r.SetInspectionEnabled("does-not-exist", true); err == nil {
+		t.Fatal("expected error for unknown tunnel id")
+	}
+}

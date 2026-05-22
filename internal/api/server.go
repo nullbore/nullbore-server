@@ -1415,7 +1415,12 @@ func parseReplayResponse(buf []byte, truncated bool, durationMs int64) replayRes
 	statusEnd := bytes.Index(buf, []byte("\r\n"))
 	if statusEnd > 0 {
 		out.Status = parseStatusLine(buf[:statusEnd])
-		out.Headers = string(buf[statusEnd+2 : headerEnd])
+		// Guard against the no-header case where statusEnd+2 == headerEnd:
+		// the response looked like "HTTP/1.1 200 OK\r\n\r\n<body>" with
+		// nothing in between. Slicing buf[17:15] panics.
+		if statusEnd+2 <= headerEnd {
+			out.Headers = string(buf[statusEnd+2 : headerEnd])
+		}
 	}
 	body := buf[headerEnd+4:]
 	if len(body) > 32*1024 {
