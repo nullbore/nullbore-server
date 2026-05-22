@@ -128,6 +128,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /v1/admin/tunnels", s.handleAdminListTunnels)
 	admin.HandleFunc("DELETE /v1/admin/tunnels/{id}", s.handleAdminCloseTunnel)
 	admin.HandleFunc("POST /v1/admin/tunnels/{id}/suspend", s.handleAdminSuspendTunnel)
+	admin.HandleFunc("GET /v1/admin/tunnels/{id}/requests", s.handleAdminListRequests)
 	s.mux.Handle("/v1/admin/", s.adminMiddleware(admin))
 
 	// Dashboard (if enabled)
@@ -270,6 +271,24 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	}
 	reqPrefix := append(reqBytes, bodyBytes...)
+
+	// Log request for inspection (async, non-blocking). Subdomain-routed
+	// traffic uses r.URL.Path directly — the path is not embedded in a route
+	// segment like the /t/{slug} path-based proxy.
+	if s.cfg.Events != nil {
+		logBody := bodyBytes
+		if len(logBody) > 4096 {
+			logBody = logBody[:4096]
+		}
+		logPath := r.URL.Path
+		if logPath == "" {
+			logPath = "/"
+		}
+		if r.URL.RawQuery != "" {
+			logPath += "?" + r.URL.RawQuery
+		}
+		go s.logRequest(t, r, logPath, logBody)
+	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -866,6 +885,16 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Request inspection is a Dev+ feature. Free-tier callers see a 402 so
+	// the dashboard can render an upgrade nudge instead of an empty list.
+	switch auth.TierFrom(r.Context()) {
+	case "dev", "pro":
+		// allowed
+	default:
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires the Dev plan or higher"})
+		return
+	}
+
 	if s.cfg.Events == nil {
 		writeJSON(w, http.StatusOK, []interface{}{})
 		return
@@ -960,7 +989,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if len(logBody) > 4096 {
 			logBody = logBody[:4096]
 		}
-		go s.logRequest(t, r, logBody)
+		path := "/" + r.PathValue("path")
+		if r.URL.RawQuery != "" {
+			path += "?" + r.URL.RawQuery
+		}
+		go s.logRequest(t, r, path, logBody)
 	}
 
 	// Hijack the HTTP connection to get the raw TCP conn
@@ -1165,6 +1198,28 @@ func (s *Server) handleAdminSuspendTunnel(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"status": state})
 }
 
+// handleAdminListRequests returns the request inspection log for any tunnel by ID.
+// Tier gating is the dashboard's responsibility — admin callers are trusted.
+func (s *Server) handleAdminListRequests(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.cfg.Events == nil {
+		writeJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	logs, err := s.cfg.Events.ListRequests(id, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list requests"})
+		return
+	}
+	writeJSON(w, http.StatusOK, logs)
+}
+
 // publicURL returns the public-facing URL for a tunnel slug.
 // Uses subdomain routing if base_domain is set, otherwise falls back to path-based.
 func (s *Server) publicURL(slug string) string {
@@ -1251,7 +1306,10 @@ func isGeneratedSlug(slug string) bool {
 }
 
 // logRequest records request metadata for the tunnel inspection log.
-func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
+// path is the customer-visible URL path (with query string if any). Callers
+// supply it because the path-based proxy carries the relevant path in
+// r.PathValue("path"), while subdomain proxies carry it directly on r.URL.Path.
+func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, path string, body []byte) {
 	// Build headers JSON (skip large/sensitive ones)
 	hdrs := make(map[string]string)
 	for k, vs := range r.Header {
@@ -1272,11 +1330,6 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, body []byte) {
 		} else {
 			snippet = string(body)
 		}
-	}
-
-	path := "/" + r.PathValue("path")
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
 	}
 
 	if s.cfg.Events != nil {
