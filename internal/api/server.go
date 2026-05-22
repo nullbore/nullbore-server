@@ -131,6 +131,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /v1/admin/tunnels/{id}/suspend", s.handleAdminSuspendTunnel)
 	admin.HandleFunc("GET /v1/admin/tunnels/{id}/requests", s.handleAdminListRequests)
 	admin.HandleFunc("POST /v1/admin/tunnels/{id}/inspection", s.handleAdminSetInspection)
+	admin.HandleFunc("POST /v1/admin/tunnels/{id}/requests/{reqID}/replay", s.handleAdminReplayRequest)
 	s.mux.Handle("/v1/admin/", s.adminMiddleware(admin))
 
 	// Dashboard (if enabled)
@@ -1272,6 +1273,157 @@ func (s *Server) handleAdminSetInspection(w http.ResponseWriter, r *http.Request
 		s.cfg.Events.LogEvent(id, "", state, "via admin API")
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"inspection_enabled": req.Enabled})
+}
+
+// replayResult is the JSON returned by handleAdminReplayRequest.
+type replayResult struct {
+	Status     int    `json:"status"`
+	Headers    string `json:"headers"`
+	Body       string `json:"body"`
+	Truncated  bool   `json:"truncated"`
+	DurationMs int64  `json:"duration_ms"`
+	Err        string `json:"error,omitempty"`
+}
+
+// handleAdminReplayRequest re-issues a previously-logged request through the
+// tunnel and returns the upstream response inline. Powers the dashboard's
+// Replay button. Tier gating is the dashboard's responsibility — admin
+// callers are trusted.
+//
+// The replay reuses the existing relay path: we fabricate an inbound
+// connection via net.Pipe, hand one end to RelayConnWithLog (so the request
+// flows through the same code that handles real traffic), and read the
+// upstream response off the other end. Replays themselves are NOT logged
+// to request_log so they don't pollute the inspector view.
+func (s *Server) handleAdminReplayRequest(w http.ResponseWriter, r *http.Request) {
+	tunnelID := r.PathValue("id")
+	reqID := r.PathValue("reqID")
+
+	t, ok := s.cfg.Registry.Get(tunnelID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if s.cfg.Events == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "inspection store unavailable"})
+		return
+	}
+	logEntry, err := s.cfg.Events.GetRequest(reqID)
+	if err != nil || logEntry == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "request not found"})
+		return
+	}
+	if logEntry.TunnelID != tunnelID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "request not found"})
+		return
+	}
+
+	// Reconstruct raw HTTP request bytes from the logged row. Drop the query
+	// string from path if it would be supplied separately, but here we just
+	// pass it through verbatim — local services accept "GET /foo?bar=1 HTTP/1.1".
+	path := logEntry.Path
+	if path == "" {
+		path = "/"
+	}
+	var reqBuf bytes.Buffer
+	fmt.Fprintf(&reqBuf, "%s %s HTTP/1.1\r\n", logEntry.Method, path)
+	fmt.Fprintf(&reqBuf, "Host: localhost\r\n")
+	fmt.Fprintf(&reqBuf, "Connection: close\r\n")
+	if logEntry.Headers != "" {
+		hdrs := map[string]string{}
+		json.Unmarshal([]byte(logEntry.Headers), &hdrs)
+		for k, v := range hdrs {
+			lower := strings.ToLower(k)
+			if lower == "host" || lower == "connection" || lower == "upgrade" ||
+				lower == "transfer-encoding" || lower == "proxy-connection" ||
+				lower == "keep-alive" || lower == "te" || lower == "trailer" ||
+				lower == "content-length" {
+				continue
+			}
+			if v == "[redacted]" {
+				continue
+			}
+			fmt.Fprintf(&reqBuf, "%s: %s\r\n", k, v)
+		}
+	}
+	if logEntry.BodySnip != "" {
+		fmt.Fprintf(&reqBuf, "Content-Length: %d\r\n", len(logEntry.BodySnip))
+	}
+	reqBuf.WriteString("\r\n")
+	if logEntry.BodySnip != "" {
+		reqBuf.WriteString(logEntry.BodySnip)
+	}
+
+	// Set up a synthetic inbound conn. Server side goes through RelayConn;
+	// client side is what we read the response back from.
+	serverSide, clientSide := net.Pipe()
+	// Hard ceiling so a stuck local service can't pin a goroutine forever.
+	clientSide.SetDeadline(time.Now().Add(15 * time.Second))
+
+	respDone := make(chan replayResult, 1)
+	startedAt := time.Now()
+	go func() {
+		defer clientSide.Close()
+		buf := make([]byte, 0, 64*1024)
+		read := make([]byte, 16*1024)
+		const maxRead = 256 * 1024 // 256 KB cap on captured response
+		for {
+			n, err := clientSide.Read(read)
+			if n > 0 {
+				if len(buf)+n > maxRead {
+					buf = append(buf, read[:maxRead-len(buf)]...)
+					respDone <- parseReplayResponse(buf, true, time.Since(startedAt).Milliseconds())
+					return
+				}
+				buf = append(buf, read[:n]...)
+			}
+			if err != nil {
+				respDone <- parseReplayResponse(buf, false, time.Since(startedAt).Milliseconds())
+				return
+			}
+		}
+	}()
+
+	if err := s.wsHub.RelayConnWithLog(t.ID, serverSide, reqBuf.Bytes(), "", time.Time{}, nil); err != nil {
+		serverSide.Close()
+		clientSide.Close()
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+
+	select {
+	case result := <-respDone:
+		writeJSON(w, http.StatusOK, result)
+	case <-time.After(20 * time.Second):
+		clientSide.Close()
+		serverSide.Close()
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "replay timed out"})
+	}
+}
+
+// parseReplayResponse splits the raw response bytes into status / headers /
+// body for JSON return.
+func parseReplayResponse(buf []byte, truncated bool, durationMs int64) replayResult {
+	out := replayResult{Truncated: truncated, DurationMs: durationMs}
+	headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		if len(buf) == 0 {
+			out.Err = "no response received (local service likely down)"
+		}
+		return out
+	}
+	statusEnd := bytes.Index(buf, []byte("\r\n"))
+	if statusEnd > 0 {
+		out.Status = parseStatusLine(buf[:statusEnd])
+		out.Headers = string(buf[statusEnd+2 : headerEnd])
+	}
+	body := buf[headerEnd+4:]
+	if len(body) > 32*1024 {
+		body = body[:32*1024]
+		out.Truncated = true
+	}
+	out.Body = string(body)
+	return out
 }
 
 // handleAdminListRequests returns the request inspection log for any tunnel by ID.
