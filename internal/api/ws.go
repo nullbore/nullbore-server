@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,9 +63,24 @@ const (
 
 // pendingConn holds a hijacked connection plus the reconstructed HTTP request.
 type pendingConn struct {
-	conn       net.Conn
-	reqPrefix  []byte  // Reconstructed HTTP request (method, path, headers, body prefix)
-	tunnelID   string  // For byte counting after relay
+	conn      net.Conn
+	reqPrefix []byte // Reconstructed HTTP request (method, path, headers, body prefix)
+	tunnelID  string // For byte counting after relay
+
+	// Request inspection correlation. When reqLogID is non-empty, the relay
+	// sniffs the first HTTP response line, parses the status code, and calls
+	// events.UpdateResponse(reqLogID, ...) to attach status + latency to the
+	// previously-inserted request_log row. nil events store disables this.
+	reqLogID string
+	reqStart time.Time
+	events   responseRecorder
+}
+
+// responseRecorder is the minimal subset of EventStore needed by the relay
+// to attach response data. Declared as an interface so ws.go doesn't have
+// to import the store package.
+type responseRecorder interface {
+	UpdateResponse(id string, statusCode int, durationMs int64, responseBytes int64)
 }
 
 type controlConn struct {
@@ -242,10 +259,115 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// If inspection is enabled for this request, wrap the inbound-conn writer
+	// so we sniff the first HTTP response line on the way back to the client.
+	// Bytes flowing dataConn → pc.conn are the response from the local service;
+	// the sniffer parses the status line and remembers the count.
+	var sniffer *responseSniffer
+	clientWriter := io.Writer(pc.conn)
+	if pc.reqLogID != "" && pc.events != nil {
+		sniffer = &responseSniffer{w: pc.conn}
+		clientWriter = sniffer
+	}
+
 	// Pipe bidirectionally: inbound conn ↔ data WebSocket (with byte counting)
-	pipeWithStats(pc.conn, dataConn, t, prefixBytes)
+	pipeWithStatsWriter(pc.conn, dataConn, clientWriter, t, prefixBytes)
 	close(done)
 	atomic.AddInt64(&h.activeRelays, -1)
+
+	if sniffer != nil {
+		ms := time.Since(pc.reqStart).Milliseconds()
+		pc.events.UpdateResponse(pc.reqLogID, sniffer.status, ms, sniffer.bytes)
+	}
+}
+
+// responseSniffer wraps an io.Writer so the first ~4KB of bytes are scanned
+// for an HTTP response status line ("HTTP/1.1 200 OK\r\n"). Once status is
+// captured (or the prefix buffer fills), pass-through writes proceed normally
+// while keeping a running byte count. WebSocket-upgrade responses look like
+// "HTTP/1.1 101 Switching Protocols" — status 101 is still useful to log.
+type responseSniffer struct {
+	w       io.Writer
+	prefix  []byte // accumulated head bytes until we've parsed (or given up)
+	parsed  bool
+	status  int
+	bytes   int64
+}
+
+func (s *responseSniffer) Write(p []byte) (int, error) {
+	if !s.parsed {
+		if len(s.prefix)+len(p) > 4096 {
+			s.prefix = append(s.prefix, p[:4096-len(s.prefix)]...)
+		} else {
+			s.prefix = append(s.prefix, p...)
+		}
+		// Look for the first CR (end of status line).
+		for i, b := range s.prefix {
+			if b == '\r' {
+				s.status = parseStatusLine(s.prefix[:i])
+				s.parsed = true
+				break
+			}
+		}
+		if !s.parsed && len(s.prefix) >= 4096 {
+			s.parsed = true // give up; leave status = 0
+		}
+	}
+	n, err := s.w.Write(p)
+	s.bytes += int64(n)
+	return n, err
+}
+
+// parseStatusLine extracts the status code from an HTTP/1.x status line.
+// Returns 0 if the line is malformed.
+func parseStatusLine(line []byte) int {
+	// Format: "HTTP/1.1 200 OK"
+	parts := bytes.SplitN(line, []byte(" "), 3)
+	if len(parts) < 2 || !bytes.HasPrefix(parts[0], []byte("HTTP/")) {
+		return 0
+	}
+	code, err := strconv.Atoi(string(parts[1]))
+	if err != nil || code < 100 || code > 599 {
+		return 0
+	}
+	return code
+}
+
+// pipeWithStatsWriter is pipeWithStats but the b→a direction writes through
+// a custom writer (e.g. responseSniffer). Useful when the response stream
+// needs interception without touching the inbound→outbound side.
+func pipeWithStatsWriter(a net.Conn, b io.ReadWriteCloser, aWriter io.Writer, t *tunnel.Tunnel, extraIn int64) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	inCounter := &countingReader{r: a}
+	outCounter := &countingReader{r: b}
+
+	cp := func(dst io.WriteCloser, src io.Reader) {
+		defer wg.Done()
+		io.Copy(dst, src)
+		dst.Close()
+	}
+
+	// internet → local (bytes in)
+	go cp(b, inCounter)
+
+	// local → internet (bytes out) — routed through aWriter so callers can
+	// sniff/transform; we still need to close `a` when the copy finishes so
+	// the inbound→outbound direction also exits.
+	go func() {
+		defer wg.Done()
+		io.Copy(aWriter, outCounter)
+		a.Close()
+	}()
+
+	wg.Wait()
+	a.Close()
+	b.Close()
+
+	if t != nil {
+		t.AddBytes(inCounter.Count()+extraIn, outCounter.Count())
+	}
 }
 
 // sendConnection notifies the client over the control channel that a new connection needs handling.
@@ -271,6 +393,14 @@ func (h *WSHub) sendConnection(tunnelID string, connID string) error {
 // RelayConn handles an inbound connection to a tunnel.
 // reqPrefix is the reconstructed HTTP request bytes (since the handler already consumed them).
 func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) error {
+	return h.RelayConnWithLog(tunnelID, inbound, reqPrefix, "", time.Time{}, nil)
+}
+
+// RelayConnWithLog is like RelayConn but also threads a request_log row id
+// through to the relay so the response status + latency can be attached when
+// the upstream HTTP response flows back. Pass reqLogID="" and events=nil to
+// disable inspection correlation for this relay.
+func (h *WSHub) RelayConnWithLog(tunnelID string, inbound net.Conn, reqPrefix []byte, reqLogID string, reqStart time.Time, events responseRecorder) error {
 	// Check pending queue depth for this tunnel (prevent flood)
 	h.pendingMu.Lock()
 	pendingCount := 0
@@ -292,6 +422,9 @@ func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) e
 		conn:      inbound,
 		reqPrefix: reqPrefix,
 		tunnelID:  tunnelID,
+		reqLogID:  reqLogID,
+		reqStart:  reqStart,
+		events:    events,
 	}
 
 	// Register the pending connection

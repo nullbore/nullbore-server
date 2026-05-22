@@ -72,16 +72,19 @@ func New(path string) (*Store, error) {
 
 // RequestLog represents a logged HTTP request to a tunnel.
 type RequestLog struct {
-	ID        string    `json:"id"`
-	TunnelID  string    `json:"tunnel_id"`
-	Slug      string    `json:"slug"`
-	Method    string    `json:"method"`
-	Path      string    `json:"path"`
-	Headers   string    `json:"headers"` // JSON-encoded headers
-	BodySize  int64     `json:"body_size"`
-	BodySnip  string    `json:"body_snippet,omitempty"` // first 4KB
-	RemoteIP  string    `json:"remote_ip"`
-	CreatedAt time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	TunnelID      string    `json:"tunnel_id"`
+	Slug          string    `json:"slug"`
+	Method        string    `json:"method"`
+	Path          string    `json:"path"`
+	Headers       string    `json:"headers"` // JSON-encoded headers
+	BodySize      int64     `json:"body_size"`
+	BodySnip      string    `json:"body_snippet,omitempty"` // first 4KB
+	RemoteIP      string    `json:"remote_ip"`
+	CreatedAt     time.Time `json:"created_at"`
+	StatusCode    int       `json:"status_code,omitempty"`    // populated after response sniff
+	DurationMs    int64     `json:"duration_ms,omitempty"`    // server-side request→response delta
+	ResponseBytes int64     `json:"response_bytes,omitempty"` // total bytes in the upstream response
 }
 
 func (s *Store) migrate() error {

@@ -277,7 +277,10 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 	// Log request for inspection (async, non-blocking). Opt-in per tunnel —
 	// no writes unless the owner enabled inspection. Subdomain-routed traffic
 	// uses r.URL.Path directly.
+	reqLogID := ""
+	reqStart := time.Now()
 	if s.cfg.Events != nil && t.InspectionEnabled {
+		reqLogID = s.cfg.Events.NewRequestID()
 		logBody := bodyBytes
 		if len(logBody) > 4096 {
 			logBody = logBody[:4096]
@@ -289,7 +292,7 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		if r.URL.RawQuery != "" {
 			logPath += "?" + r.URL.RawQuery
 		}
-		go s.logRequest(t, r, logPath, logBody)
+		go s.logRequest(reqLogID, t, r, logPath, logBody)
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -310,7 +313,7 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sl
 		conn = &prefixConn{Conn: conn, prefix: buffered}
 	}
 
-	if err := s.wsHub.RelayConn(t.ID, conn, reqPrefix); err != nil {
+	if err := s.wsHub.RelayConnWithLog(t.ID, conn, reqPrefix, reqLogID, reqStart, s.cfg.Events); err != nil {
 		log.Printf("relay error: tunnel=%s err=%v", t.ID, err)
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 25\r\n\r\ntunnel client unavailable"))
 		conn.Close()
@@ -985,7 +988,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	reqPrefix := append(reqBytes, bodyBytes...)
 
 	// Log request for inspection (async, non-blocking). Opt-in per tunnel.
-	if s.cfg.Store != nil && t.InspectionEnabled {
+	reqLogID := ""
+	reqStart := time.Now()
+	if s.cfg.Events != nil && t.InspectionEnabled {
+		reqLogID = s.cfg.Events.NewRequestID()
 		logBody := bodyBytes
 		if len(logBody) > 4096 {
 			logBody = logBody[:4096]
@@ -994,7 +1000,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" {
 			path += "?" + r.URL.RawQuery
 		}
-		go s.logRequest(t, r, path, logBody)
+		go s.logRequest(reqLogID, t, r, path, logBody)
 	}
 
 	// Hijack the HTTP connection to get the raw TCP conn
@@ -1018,7 +1024,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hand the raw connection to the hub for relay
-	if err := s.wsHub.RelayConn(t.ID, conn, reqPrefix); err != nil {
+	if err := s.wsHub.RelayConnWithLog(t.ID, conn, reqPrefix, reqLogID, reqStart, s.cfg.Events); err != nil {
 		log.Printf("relay error: tunnel=%s err=%v", t.ID, err)
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 25\r\n\r\ntunnel client unavailable"))
 		conn.Close()
@@ -1375,11 +1381,13 @@ func isGeneratedSlug(slug string) bool {
 	return true
 }
 
-// logRequest records request metadata for the tunnel inspection log.
-// path is the customer-visible URL path (with query string if any). Callers
-// supply it because the path-based proxy carries the relevant path in
-// r.PathValue("path"), while subdomain proxies carry it directly on r.URL.Path.
-func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, path string, body []byte) {
+// logRequest records request metadata for the tunnel inspection log under
+// the given id. path is the customer-visible URL path (with query string if
+// any). Callers supply it because the path-based proxy carries the relevant
+// path in r.PathValue("path"), while subdomain proxies carry it directly on
+// r.URL.Path. id should be minted via cfg.Events.NewRequestID() so the relay
+// path can correlate the upstream response back via UpdateResponse.
+func (s *Server) logRequest(id string, t *tunnel.Tunnel, r *http.Request, path string, body []byte) {
 	// Build headers JSON (skip large/sensitive ones)
 	hdrs := make(map[string]string)
 	for k, vs := range r.Header {
@@ -1403,7 +1411,7 @@ func (s *Server) logRequest(t *tunnel.Tunnel, r *http.Request, path string, body
 	}
 
 	if s.cfg.Events != nil {
-		s.cfg.Events.LogRequest(t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, s.clientIP(r))
+		s.cfg.Events.LogRequestWithID(id, t.ID, t.Slug, r.Method, path, string(headersJSON), int64(len(body)), snippet, s.clientIP(r))
 	}
 }
 

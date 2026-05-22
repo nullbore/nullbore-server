@@ -56,12 +56,28 @@ func (s *EventStore) migrate() error {
 			body_size INTEGER NOT NULL DEFAULT 0,
 			body_snippet TEXT NOT NULL DEFAULT '',
 			remote_ip TEXT NOT NULL DEFAULT '',
-			created_at DATETIME NOT NULL
+			created_at DATETIME NOT NULL,
+			status_code INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			response_bytes INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_reqlog_tunnel ON request_log(tunnel_id, created_at);
 		CREATE INDEX IF NOT EXISTS idx_reqlog_time ON request_log(created_at);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Idempotent migrations for previously-deployed DBs that pre-date these
+	// columns. ALTER TABLE returns "duplicate column" if already applied —
+	// safe to ignore.
+	for _, alter := range []string{
+		`ALTER TABLE request_log ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_log ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_log ADD COLUMN response_bytes INTEGER NOT NULL DEFAULT 0`,
+	} {
+		s.db.Exec(alter)
+	}
+	return nil
 }
 
 // LogEvent records a tunnel lifecycle event.
@@ -116,12 +132,43 @@ func (s *EventStore) GetEventsByClient(clientID string, limit int) ([]TunnelEven
 	return events, nil
 }
 
-// LogRequest records an HTTP request to a tunnel.
-func (s *EventStore) LogRequest(tunnelID, slug, method, path, headers string, bodySize int64, bodySnippet, remoteIP string) {
-	id := hex.EncodeToString(evtRandomBytes(16))
+// LogRequest records an HTTP request to a tunnel. If id is empty, one is
+// generated. Returns the id used so callers can later attach response info
+// via UpdateResponse.
+func (s *EventStore) LogRequest(tunnelID, slug, method, path, headers string, bodySize int64, bodySnippet, remoteIP string) string {
+	return s.LogRequestWithID("", tunnelID, slug, method, path, headers, bodySize, bodySnippet, remoteIP)
+}
+
+// LogRequestWithID is like LogRequest but lets the caller specify the row id
+// up-front. Useful when the relay path needs to know the id before the DB
+// write has completed (so it can correlate the upstream response back).
+func (s *EventStore) LogRequestWithID(id, tunnelID, slug, method, path, headers string, bodySize int64, bodySnippet, remoteIP string) string {
+	if id == "" {
+		id = hex.EncodeToString(evtRandomBytes(16))
+	}
 	s.db.Exec(
 		`INSERT INTO request_log (id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, tunnelID, slug, method, path, headers, bodySize, bodySnippet, remoteIP, time.Now())
+	return id
+}
+
+// NewRequestID returns a freshly-generated request log id without writing
+// a row. Use this when the relay path needs to mint the id before the
+// async LogRequestWithID INSERT runs.
+func (s *EventStore) NewRequestID() string {
+	return hex.EncodeToString(evtRandomBytes(16))
+}
+
+// UpdateResponse attaches response status, duration, and byte count to a
+// previously-logged request row. Idempotent — called from the relay path
+// when the upstream HTTP response is sniffed or when the pipe closes.
+func (s *EventStore) UpdateResponse(id string, statusCode int, durationMs int64, responseBytes int64) {
+	if id == "" {
+		return
+	}
+	s.db.Exec(
+		`UPDATE request_log SET status_code = ?, duration_ms = ?, response_bytes = ? WHERE id = ?`,
+		statusCode, durationMs, responseBytes, id)
 }
 
 // ListRequests returns recent request logs for a tunnel.
@@ -132,10 +179,10 @@ func (s *EventStore) ListRequests(tunnelID string, limit int) ([]RequestLog, err
 	var query string
 	var args []interface{}
 	if tunnelID != "" {
-		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at FROM request_log WHERE tunnel_id = ? ORDER BY created_at DESC LIMIT ?`
+		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at, status_code, duration_ms, response_bytes FROM request_log WHERE tunnel_id = ? ORDER BY created_at DESC LIMIT ?`
 		args = []interface{}{tunnelID, limit}
 	} else {
-		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at FROM request_log ORDER BY created_at DESC LIMIT ?`
+		query = `SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at, status_code, duration_ms, response_bytes FROM request_log ORDER BY created_at DESC LIMIT ?`
 		args = []interface{}{limit}
 	}
 	rows, err := s.db.Query(query, args...)
@@ -146,7 +193,7 @@ func (s *EventStore) ListRequests(tunnelID string, limit int) ([]RequestLog, err
 	var logs []RequestLog
 	for rows.Next() {
 		var r RequestLog
-		if err := rows.Scan(&r.ID, &r.TunnelID, &r.Slug, &r.Method, &r.Path, &r.Headers, &r.BodySize, &r.BodySnip, &r.RemoteIP, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TunnelID, &r.Slug, &r.Method, &r.Path, &r.Headers, &r.BodySize, &r.BodySnip, &r.RemoteIP, &r.CreatedAt, &r.StatusCode, &r.DurationMs, &r.ResponseBytes); err != nil {
 			return nil, err
 		}
 		logs = append(logs, r)
