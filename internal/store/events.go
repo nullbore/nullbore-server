@@ -171,6 +171,21 @@ func (s *EventStore) UpdateResponse(id string, statusCode int, durationMs int64,
 		statusCode, durationMs, responseBytes, id)
 }
 
+// GetRequest fetches a single request_log row by id. Returns nil if not found.
+func (s *EventStore) GetRequest(id string) (*RequestLog, error) {
+	row := s.db.QueryRow(
+		`SELECT id, tunnel_id, slug, method, path, headers, body_size, body_snippet, remote_ip, created_at, status_code, duration_ms, response_bytes FROM request_log WHERE id = ?`,
+		id)
+	var r RequestLog
+	if err := row.Scan(&r.ID, &r.TunnelID, &r.Slug, &r.Method, &r.Path, &r.Headers, &r.BodySize, &r.BodySnip, &r.RemoteIP, &r.CreatedAt, &r.StatusCode, &r.DurationMs, &r.ResponseBytes); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
 // ListRequests returns recent request logs for a tunnel.
 func (s *EventStore) ListRequests(tunnelID string, limit int) ([]RequestLog, error) {
 	if limit <= 0 {
