@@ -25,16 +25,23 @@ var (
 		MonthlyBandwidth: 2 * 1024 * 1024 * 1024, // 2 GB
 		Webhooks: false, CustomDomains: false, MaxAPIKeys: 1,
 	}
-	TierDev = Tier{
-		Name: "dev", MaxTunnels: 5, MaxTTLHours: 0, // 0 = persistent
-		MonthlyBandwidth: 50 * 1024 * 1024 * 1024, // 50 GB
-		Webhooks: true, CustomDomains: false, MaxAPIKeys: 5,
+	TierBasic = Tier{
+		Name: "basic", MaxTunnels: 1, MaxTTLHours: 0, // per-slot; persistent
+		MonthlyBandwidth: 50 * 1024 * 1024 * 1024, // 50 GB / slot
+		Webhooks: true, CustomDomains: false, MaxAPIKeys: 3,
+	}
+	TierPlus = Tier{
+		Name: "plus", MaxTunnels: 5, MaxTTLHours: 0, // 5 included slots; persistent
+		MonthlyBandwidth: 250 * 1024 * 1024 * 1024, // 250 GB (5 × 50)
+		Webhooks: true, CustomDomains: true, MaxAPIKeys: 5,
 	}
 	TierPro = Tier{
-		Name: "pro", MaxTunnels: 20, MaxTTLHours: 0, // 0 = persistent
-		MonthlyBandwidth: 200 * 1024 * 1024 * 1024, // 200 GB
+		Name: "pro", MaxTunnels: 20, MaxTTLHours: 0, // 20 included slots; persistent
+		MonthlyBandwidth: 1000 * 1024 * 1024 * 1024, // 1 TB (20 × 50)
 		Webhooks: true, CustomDomains: true, MaxAPIKeys: 10,
 	}
+	// TierDev is the legacy pre-2026 plan, migrated to Plus.
+	TierDev = TierPlus
 )
 
 // HostedConfig holds configuration for the hosted (commercial) dashboard.
@@ -170,8 +177,10 @@ func HostedHandler(cfg HostedConfig) http.Handler {
 // TierFor returns the tier for a given plan name.
 func TierFor(name string) Tier {
 	switch name {
-	case "dev":
-		return TierDev
+	case "basic":
+		return TierBasic
+	case "plus", "dev":
+		return TierPlus
 	case "pro":
 		return TierPro
 	default:

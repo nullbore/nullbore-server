@@ -80,9 +80,11 @@ func NewServer(cfg Config) *Server {
 		// Per-tunnel proxy rate limiters by tier.
 		// Use per-second refill intervals to avoid minute-boundary starvation.
 		proxyLimiters: map[string]*RateLimiter{
-			"free": NewRateLimiter(10, time.Second, 60),       // moderate guardrail for abuse
-			"dev":  NewRateLimiter(1000, time.Second, 2000),   // effectively unbounded for normal web traffic
-			"pro":  NewRateLimiter(10000, time.Second, 10000), // practically unlimited
+			"free":  NewRateLimiter(10, time.Second, 60),       // moderate guardrail for abuse
+			"basic": NewRateLimiter(1000, time.Second, 2000),   // effectively unbounded for normal web traffic
+			"plus":  NewRateLimiter(1000, time.Second, 2000),   //
+			"dev":   NewRateLimiter(1000, time.Second, 2000),   // legacy alias
+			"pro":   NewRateLimiter(10000, time.Second, 10000), // practically unlimited
 		},
 	}
 	s.routes()
@@ -499,12 +501,10 @@ type createTunnelRequest struct {
 
 // tierMaxTTL returns the max TTL for a tier.
 func tierMaxTTL(tier string) time.Duration {
-	switch tier {
-	case "pro", "dev":
+	if tierIsPaid(tier) {
 		return 0 // no limit (persistent)
-	default: // free or unknown
-		return 2 * time.Hour
 	}
+	return 2 * time.Hour // free or unknown
 }
 
 // checkTunnelAuth returns true if the request passes the tunnel's basic auth check.
@@ -552,7 +552,7 @@ func tierMaxBodyBytes(tier string) int64 {
 	switch tier {
 	case "pro":
 		return 500 * 1024 * 1024
-	case "dev":
+	case "basic", "plus", "dev":
 		return 100 * 1024 * 1024
 	default: // free
 		return 25 * 1024 * 1024
@@ -564,8 +564,10 @@ func tierTunnelLimit(tier string) int {
 	switch tier {
 	case "pro":
 		return 20
-	case "dev":
+	case "plus", "dev":
 		return 5
+	case "basic":
+		return 1
 	default: // free or unknown
 		return 1
 	}
@@ -654,9 +656,9 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		ttl = parsed
 	}
 
-	// TTL=0 means persistent (dev and pro only)
+	// TTL=0 means persistent (paid tiers only)
 	if ttl == 0 {
-		if tier != "pro" && tier != "dev" {
+		if !tierIsPaid(tier) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "persistent tunnels require a paid plan"})
 			return
 		}
@@ -671,7 +673,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	// Idle TTL (TTL resets on activity) is only available on paid tiers.
 	// Without this gate, free users could keep a 2-hour tunnel alive
 	// indefinitely by sending periodic pings.
-	if req.IdleTTL && tier != "dev" && tier != "pro" {
+	if req.IdleTTL && !tierIsPaid(tier) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "idle timeout mode requires a paid plan"})
 		return
 	}
@@ -893,11 +895,8 @@ func (s *Server) handleListRequests(w http.ResponseWriter, r *http.Request) {
 
 	// Request inspection is a Dev+ feature. Free-tier callers see a 402 so
 	// the dashboard can render an upgrade nudge instead of an empty list.
-	switch auth.TierFrom(r.Context()) {
-	case "dev", "pro":
-		// allowed
-	default:
-		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires the Dev plan or higher"})
+	if !tierIsPaid(auth.TierFrom(r.Context())) {
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires a paid plan"})
 		return
 	}
 
@@ -1221,11 +1220,8 @@ func (s *Server) handleSetInspection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not your tunnel"})
 		return
 	}
-	switch auth.TierFrom(r.Context()) {
-	case "dev", "pro":
-		// allowed
-	default:
-		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires the Dev plan or higher"})
+	if !tierIsPaid(auth.TierFrom(r.Context())) {
+		writeJSON(w, http.StatusPaymentRequired, map[string]string{"error": "request inspection requires a paid plan"})
 		return
 	}
 
