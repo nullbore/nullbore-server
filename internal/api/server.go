@@ -856,6 +856,16 @@ func (s *Server) handleExtendTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hosted free tunnels have a hard 2-hour session cap. Without this gate a
+	// free caller could repeatedly extend (stable URL and all) past the limit,
+	// turning the free tier into a free persistent tunnel. Gate on the explicit
+	// "free" tier only — self-hosted/static-auth callers have an empty tier and
+	// must remain unrestricted.
+	if auth.TierFrom(r.Context()) == "free" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "free tunnels have a fixed 2-hour limit; extending requires a paid plan"})
+		return
+	}
+
 	var req extendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})

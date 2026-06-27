@@ -625,3 +625,39 @@ func hitProxy(t *testing.T, ts *httptest.Server, slug, path string) {
 	proxyConn.Read(buf)
 }
 
+
+// TestHandleExtendTunnel_TierGate verifies free tunnels cannot be extended past
+// their hard 2-hour cap (extend is a paid capability), while paid tiers can.
+func TestHandleExtendTunnel_TierGate(t *testing.T) {
+	cases := []struct {
+		tier     string
+		wantCode int
+	}{
+		{"free", http.StatusForbidden},
+		{"basic", http.StatusOK},
+		{"plus", http.StatusOK},
+		{"pro", http.StatusOK},
+	}
+	for _, c := range cases {
+		t.Run("tier="+c.tier, func(t *testing.T) {
+			srv, ts, _, _ := newInspectableTestServer(t, c.tier)
+			defer ts.Close()
+
+			tun, _ := srv.cfg.Registry.CreateWithOptions("test", tunnel.CreateOptions{
+				LocalPort: 8080,
+				TTL:       time.Hour,
+			})
+
+			req, _ := http.NewRequest("POST", ts.URL+"/v1/tunnels/"+tun.ID+"/extend", strings.NewReader(`{"ttl":"1h"}`))
+			req.Header.Set("Authorization", "Bearer nbk_test_secret")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != c.wantCode {
+				t.Errorf("tier=%q: got %d, want %d", c.tier, resp.StatusCode, c.wantCode)
+			}
+		})
+	}
+}
