@@ -32,6 +32,9 @@ type TunnelRecord struct {
 	BytesIn   int64     `json:"bytes_in"`
 	BytesOut  int64     `json:"bytes_out"`
 	Requests  int64     `json:"requests"`
+	// Mode is the tunnel's routing mode ("relay" or "tls-passthrough").
+	// Empty is read back as "relay" (rows that pre-date the column).
+	Mode string `json:"mode"`
 }
 
 // APIKey is a stored API key.
@@ -102,7 +105,8 @@ func (s *Store) migrate() error {
 			closed_at DATETIME,
 			bytes_in INTEGER DEFAULT 0,
 			bytes_out INTEGER DEFAULT 0,
-			requests INTEGER DEFAULT 0
+			requests INTEGER DEFAULT 0,
+			mode TEXT NOT NULL DEFAULT 'relay'
 		);
 		CREATE INDEX IF NOT EXISTS idx_tunnels_slug ON tunnels(slug);
 		CREATE INDEX IF NOT EXISTS idx_tunnels_status ON tunnels(status);
@@ -150,23 +154,85 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_reqlog_tunnel ON request_log(tunnel_id, created_at);
 		CREATE INDEX IF NOT EXISTS idx_reqlog_time ON request_log(created_at);
 	`)
+	if err != nil {
+		return err
+	}
+	// Idempotent column additions for DBs created before the column existed.
+	return s.addColumnIfMissing("tunnels", "mode", `TEXT NOT NULL DEFAULT 'relay'`)
+}
+
+// addColumnIfMissing adds column to table unless it is already present.
+// Checks PRAGMA table_info first so a genuine ALTER failure is reported
+// rather than masked as "duplicate column".
+func (s *Store) addColumnIfMissing(table, column, decl string) error {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl))
 	return err
+}
+
+// tunnelColumns is the column list shared by every tunnels SELECT; keep it in
+// step with scanTunnel.
+const tunnelColumns = "id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests, mode"
+
+type rowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanTunnel(row rowScanner, t *TunnelRecord) error {
+	if err := row.Scan(&t.ID, &t.Slug, &t.ClientID, &t.LocalPort, &t.Name, &t.TTL, &t.Status, &t.CreatedAt, &t.ExpiresAt, &t.ClosedAt, &t.BytesIn, &t.BytesOut, &t.Requests, &t.Mode); err != nil {
+		return err
+	}
+	if t.Mode == "" {
+		t.Mode = "relay"
+	}
+	return nil
 }
 
 // --- Tunnel operations ---
 
 func (s *Store) SaveTunnel(t *TunnelRecord) error {
+	mode := t.Mode
+	if mode == "" {
+		mode = "relay"
+	}
 	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO tunnels (id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Slug, t.ClientID, t.LocalPort, t.Name, t.TTL, t.Status, t.CreatedAt, t.ExpiresAt, t.ClosedAt, t.BytesIn, t.BytesOut, t.Requests)
+		INSERT OR REPLACE INTO tunnels (`+tunnelColumns+`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Slug, t.ClientID, t.LocalPort, t.Name, t.TTL, t.Status, t.CreatedAt, t.ExpiresAt, t.ClosedAt, t.BytesIn, t.BytesOut, t.Requests, mode)
 	return err
 }
 
 func (s *Store) GetTunnel(id string) (*TunnelRecord, error) {
 	t := &TunnelRecord{}
-	err := s.db.QueryRow(`SELECT id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests FROM tunnels WHERE id = ?`, id).
-		Scan(&t.ID, &t.Slug, &t.ClientID, &t.LocalPort, &t.Name, &t.TTL, &t.Status, &t.CreatedAt, &t.ExpiresAt, &t.ClosedAt, &t.BytesIn, &t.BytesOut, &t.Requests)
+	err := scanTunnel(s.db.QueryRow(`SELECT `+tunnelColumns+` FROM tunnels WHERE id = ?`, id), t)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -174,7 +240,7 @@ func (s *Store) GetTunnel(id string) (*TunnelRecord, error) {
 }
 
 func (s *Store) ListTunnels(clientID string, status string, limit int) ([]TunnelRecord, error) {
-	query := "SELECT id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests FROM tunnels WHERE 1=1"
+	query := "SELECT " + tunnelColumns + " FROM tunnels WHERE 1=1"
 	args := []interface{}{}
 
 	if clientID != "" {
@@ -200,7 +266,7 @@ func (s *Store) ListTunnels(clientID string, status string, limit int) ([]Tunnel
 	var tunnels []TunnelRecord
 	for rows.Next() {
 		var t TunnelRecord
-		if err := rows.Scan(&t.ID, &t.Slug, &t.ClientID, &t.LocalPort, &t.Name, &t.TTL, &t.Status, &t.CreatedAt, &t.ExpiresAt, &t.ClosedAt, &t.BytesIn, &t.BytesOut, &t.Requests); err != nil {
+		if err := scanTunnel(rows, &t); err != nil {
 			return nil, err
 		}
 		tunnels = append(tunnels, t)
@@ -219,7 +285,7 @@ func (s *Store) CloseTunnel(id string) error {
 func (s *Store) LoadActiveTunnels() ([]TunnelRecord, error) {
 	now := time.Now()
 	rows, err := s.db.Query(`
-		SELECT id, slug, client_id, local_port, name, ttl_seconds, status, created_at, expires_at, closed_at, bytes_in, bytes_out, requests
+		SELECT `+tunnelColumns+`
 		FROM tunnels WHERE status = 'active' AND expires_at > ?
 		ORDER BY created_at`, now)
 	if err != nil {
@@ -230,7 +296,7 @@ func (s *Store) LoadActiveTunnels() ([]TunnelRecord, error) {
 	var tunnels []TunnelRecord
 	for rows.Next() {
 		var t TunnelRecord
-		if err := rows.Scan(&t.ID, &t.Slug, &t.ClientID, &t.LocalPort, &t.Name, &t.TTL, &t.Status, &t.CreatedAt, &t.ExpiresAt, &t.ClosedAt, &t.BytesIn, &t.BytesOut, &t.Requests); err != nil {
+		if err := scanTunnel(rows, &t); err != nil {
 			return nil, err
 		}
 		tunnels = append(tunnels, t)

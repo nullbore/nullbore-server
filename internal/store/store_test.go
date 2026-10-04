@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -248,5 +249,102 @@ func TestEventStoreSeparateDB(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "events.db")); err != nil {
 		t.Error("events.db not found")
+	}
+}
+
+// TestTunnelModeRoundTrip verifies the tunnel mode survives Save → Get /
+// List / LoadActiveTunnels, and that an unset mode reads back as "relay".
+// A passthrough tunnel that silently restored as relay would lose its
+// end-to-end property after a server restart.
+func TestTunnelModeRoundTrip(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	for _, rec := range []*TunnelRecord{
+		{ID: "pt", Slug: "pt1", ClientID: "u1", LocalPort: 8443, TTL: 3600, Status: "active",
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour), Mode: "tls-passthrough"},
+		{ID: "rl", Slug: "rl1", ClientID: "u1", LocalPort: 3000, TTL: 3600, Status: "active",
+			CreatedAt: now.Add(time.Second), ExpiresAt: now.Add(time.Hour)}, // Mode unset
+	} {
+		if err := s.SaveTunnel(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.GetTunnel("pt")
+	if err != nil || got == nil {
+		t.Fatalf("GetTunnel: %v %v", got, err)
+	}
+	if got.Mode != "tls-passthrough" {
+		t.Errorf("GetTunnel mode = %q, want tls-passthrough", got.Mode)
+	}
+	got, _ = s.GetTunnel("rl")
+	if got.Mode != "relay" {
+		t.Errorf("unset mode read back as %q, want relay", got.Mode)
+	}
+
+	active, err := s.LoadActiveTunnels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	modes := map[string]string{}
+	for _, r := range active {
+		modes[r.ID] = r.Mode
+	}
+	if modes["pt"] != "tls-passthrough" || modes["rl"] != "relay" {
+		t.Errorf("LoadActiveTunnels modes = %v", modes)
+	}
+
+	list, err := s.ListTunnels("u1", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListTunnels returned %d rows", len(list))
+	}
+	for _, r := range list {
+		if r.Mode != modes[r.ID] {
+			t.Errorf("ListTunnels %s mode = %q, want %q", r.ID, r.Mode, modes[r.ID])
+		}
+	}
+}
+
+// TestTunnelModeMigration opens a DB whose tunnels table pre-dates the mode
+// column (the shape currently in production), and checks New() adds the
+// column, existing rows read back as "relay", and reopening is idempotent.
+func TestTunnelModeMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+		CREATE TABLE tunnels (
+			id TEXT PRIMARY KEY, slug TEXT NOT NULL, client_id TEXT NOT NULL,
+			local_port INTEGER NOT NULL, name TEXT DEFAULT '', ttl_seconds INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active', created_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL, closed_at DATETIME,
+			bytes_in INTEGER DEFAULT 0, bytes_out INTEGER DEFAULT 0, requests INTEGER DEFAULT 0
+		);
+		INSERT INTO tunnels (id, slug, client_id, local_port, ttl_seconds, created_at, expires_at)
+		VALUES ('old', 'old1', 'u1', 3000, 3600, datetime('now'), datetime('now', '+1 hour'));`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.Close()
+
+	for i := 0; i < 2; i++ { // second open must be a no-op migration
+		s, err := New(path)
+		if err != nil {
+			t.Fatalf("open #%d: %v", i+1, err)
+		}
+		got, err := s.GetTunnel("old")
+		if err != nil || got == nil {
+			t.Fatalf("open #%d GetTunnel: %v %v", i+1, got, err)
+		}
+		if got.Mode != "relay" {
+			t.Errorf("open #%d: legacy row mode = %q, want relay", i+1, got.Mode)
+		}
+		s.Close()
 	}
 }

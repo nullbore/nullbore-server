@@ -74,6 +74,11 @@ type pendingConn struct {
 	reqLogID string
 	reqStart time.Time
 	events   responseRecorder
+
+	// raw marks an opaque (TLS passthrough) connection. The relay must never
+	// write its own bytes into such a stream — e.g. a plaintext "503" would
+	// land in the middle of a TLS session — so rejections just close.
+	raw bool
 }
 
 // responseRecorder is the minimal subset of EventStore needed by the relay
@@ -241,7 +246,9 @@ func (h *WSHub) HandleData(w http.ResponseWriter, r *http.Request) {
 	if active > maxActiveRelays {
 		atomic.AddInt64(&h.activeRelays, -1)
 		log.Printf("relay rejected: global limit reached (%d)", maxActiveRelays)
-		pc.conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nserver at capacity\n"))
+		if !pc.raw {
+			pc.conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nserver at capacity\n"))
+		}
 		pc.conn.Close()
 		dataConn.Close()
 		return
@@ -401,6 +408,36 @@ func (h *WSHub) RelayConn(tunnelID string, inbound net.Conn, reqPrefix []byte) e
 // the upstream HTTP response flows back. Pass reqLogID="" and events=nil to
 // disable inspection correlation for this relay.
 func (h *WSHub) RelayConnWithLog(tunnelID string, inbound net.Conn, reqPrefix []byte, reqLogID string, reqStart time.Time, events responseRecorder) error {
+	return h.relay(&pendingConn{
+		conn:      inbound,
+		reqPrefix: reqPrefix,
+		tunnelID:  tunnelID,
+		reqLogID:  reqLogID,
+		reqStart:  reqStart,
+		events:    events,
+	})
+}
+
+// RelayRawConn relays an opaque byte stream (TLS passthrough). prefix holds
+// bytes already consumed from inbound (the peeked ClientHello) and is
+// replayed to the client first. There is no inspection correlation, and the
+// relay never writes its own bytes into the stream: on any failure the
+// caller (or the hub) simply closes inbound.
+func (h *WSHub) RelayRawConn(tunnelID string, inbound net.Conn, prefix []byte) error {
+	return h.relay(&pendingConn{
+		conn:      inbound,
+		reqPrefix: prefix,
+		tunnelID:  tunnelID,
+		raw:       true,
+	})
+}
+
+// relay queues pc for the tunnel client and notifies it on the control
+// channel. Shared by the HTTP and raw entry points.
+func (h *WSHub) relay(pc *pendingConn) error {
+	tunnelID := pc.tunnelID
+	inbound := pc.conn
+
 	// Check pending queue depth for this tunnel (prevent flood)
 	h.pendingMu.Lock()
 	pendingCount := 0
@@ -417,15 +454,6 @@ func (h *WSHub) RelayConnWithLog(tunnelID string, inbound net.Conn, reqPrefix []
 	h.pendingMu.Unlock()
 
 	connID := uuid.New().String()
-
-	pc := &pendingConn{
-		conn:      inbound,
-		reqPrefix: reqPrefix,
-		tunnelID:  tunnelID,
-		reqLogID:  reqLogID,
-		reqStart:  reqStart,
-		events:    events,
-	}
 
 	// Register the pending connection
 	h.pendingMu.Lock()

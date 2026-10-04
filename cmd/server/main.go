@@ -119,6 +119,14 @@ func main() {
 			slog.Error("failed to load active tunnels", "error", err)
 		} else if len(restored) > 0 {
 			for _, rec := range restored {
+				// Restore the persisted mode. Anything unrecognised
+				// (including a row from a newer build) restores as relay,
+				// whose HTTP path refuses to serve passthrough tunnels
+				// anyway — never silently widens exposure.
+				mode := rec.Mode
+				if !tunnel.ValidMode(mode) {
+					mode = tunnel.ModeRelay
+				}
 				t := &tunnel.Tunnel{
 					ID:        rec.ID,
 					Slug:      rec.Slug,
@@ -126,7 +134,7 @@ func main() {
 					LocalPort: rec.LocalPort,
 					Name:      rec.Name,
 					TTL:       tunnel.Duration(time.Duration(rec.TTL) * time.Second),
-					Mode:      "relay",
+					Mode:      mode,
 					CreatedAt: rec.CreatedAt,
 					ExpiresAt: rec.ExpiresAt,
 					BytesIn:   rec.BytesIn,

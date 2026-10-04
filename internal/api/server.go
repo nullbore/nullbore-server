@@ -143,6 +143,77 @@ func (s *Server) routes() {
 	}
 }
 
+// hostRouteKind classifies a hostname into one of the routing planes.
+type hostRouteKind int
+
+const (
+	routeNone         hostRouteKind = iota // not a tunnel host — serve the API/dashboard mux
+	routeBaseSlug                          // {slug}.{BaseDomain}
+	routeAccount                           // {leaf}.{account}.{AccountDomain} or bare {account}.{AccountDomain}
+	routeCustomDomain                      // anything else: candidate custom domain (needs DomainResolver)
+)
+
+// hostRoute is the result of classifyHost.
+type hostRoute struct {
+	Kind    hostRouteKind
+	Slug    string // routeBaseSlug
+	Account string // routeAccount
+	Leaf    string // routeAccount; "" for a bare account host
+}
+
+// classifyHost decides which routing plane a hostname (port already
+// stripped) belongs to. It is pure — no registry or resolver lookups — so the
+// HTTP Host router (subdomainHandler) and the TLS SNI router
+// (resolveTunnelForHost) share exactly one definition of the namespace rules.
+//
+// Rules, in order:
+//   - BaseDomain unset: host routing is disabled entirely (routeNone).
+//   - {slug}.{BaseDomain} with a single-label slug → routeBaseSlug.
+//   - under AccountDomain: {leaf}.{account} → routeAccount; a single label
+//     other than "tunnel"/"www" → bare routeAccount (Leaf ""). Deeper names
+//     split at the first dot, so the account segment contains a dot and
+//     never resolves.
+//   - not BaseDomain and not under it → routeCustomDomain.
+//   - otherwise (BaseDomain itself, multi-label names under it that are not
+//     account hosts) → routeNone.
+func classifyHost(host, baseDomain, accountDomain string) hostRoute {
+	if baseDomain == "" {
+		return hostRoute{}
+	}
+	suffix := "." + baseDomain
+
+	// Tunnel subdomain: {slug}.tunnel.nullbore.com
+	if strings.HasSuffix(host, suffix) && host != baseDomain {
+		slug := strings.TrimSuffix(host, suffix)
+		if slug != "" && !strings.Contains(slug, ".") {
+			return hostRoute{Kind: routeBaseSlug, Slug: slug}
+		}
+	}
+
+	// Account subdomain: {tunnel}.{account}.nullbore.com
+	if accountDomain != "" {
+		acctSuffix := "." + accountDomain
+		if strings.HasSuffix(host, acctSuffix) && host != accountDomain {
+			sub := strings.TrimSuffix(host, acctSuffix)
+			parts := strings.SplitN(sub, ".", 2)
+			if len(parts) == 2 {
+				// Two-level: web.heroapp.nullbore.com → tunnel="web", account="heroapp"
+				return hostRoute{Kind: routeAccount, Account: parts[1], Leaf: parts[0]}
+			}
+			if len(parts) == 1 && parts[0] != "tunnel" && parts[0] != "www" {
+				// Single-level account subdomain: heroapp.nullbore.com
+				return hostRoute{Kind: routeAccount, Account: parts[0]}
+			}
+		}
+	}
+
+	// Custom domain candidate
+	if host != baseDomain && !strings.HasSuffix(host, suffix) {
+		return hostRoute{Kind: routeCustomDomain}
+	}
+	return hostRoute{}
+}
+
 // subdomainHandler wraps the main mux to intercept subdomain-based tunnel requests.
 // If the Host header matches {slug}.{baseDomain}, it routes to the proxy handler.
 // Otherwise it falls through to the normal mux.
@@ -150,7 +221,6 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 	if s.cfg.BaseDomain == "" {
 		return next
 	}
-	suffix := "." + s.cfg.BaseDomain
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		// Strip port if present
@@ -158,40 +228,21 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 			host = host[:idx]
 		}
 
-		// Check if this is a tunnel subdomain request: {slug}.tunnel.nullbore.com
-		if strings.HasSuffix(host, suffix) && host != s.cfg.BaseDomain {
-			slug := strings.TrimSuffix(host, suffix)
-			if slug != "" && !strings.Contains(slug, ".") {
-				s.handleSubdomainProxy(w, r, slug)
-				return
-			}
-		}
-
-		// Check if this is an account subdomain request: {tunnel}.{account}.nullbore.com
-		if s.cfg.AccountDomain != "" {
-			acctSuffix := "." + s.cfg.AccountDomain
-			if strings.HasSuffix(host, acctSuffix) && host != s.cfg.AccountDomain {
-				sub := strings.TrimSuffix(host, acctSuffix)
-				parts := strings.SplitN(sub, ".", 2)
-				if len(parts) == 2 {
-					// Two-level: web.heroapp.nullbore.com → tunnel="web", account="heroapp"
-					s.handleAccountSubdomainProxy(w, r, parts[1], parts[0])
+		route := classifyHost(host, s.cfg.BaseDomain, s.cfg.AccountDomain)
+		switch route.Kind {
+		case routeBaseSlug:
+			s.handleSubdomainProxy(w, r, route.Slug)
+			return
+		case routeAccount:
+			s.handleAccountSubdomainProxy(w, r, route.Account, route.Leaf)
+			return
+		case routeCustomDomain:
+			if s.cfg.DomainResolver != nil {
+				slug, _, err := s.cfg.DomainResolver.Resolve(host)
+				if err == nil && slug != "" {
+					s.handleSubdomainProxy(w, r, slug)
 					return
 				}
-				if len(parts) == 1 && parts[0] != "tunnel" && parts[0] != "www" {
-					// Single-level account subdomain: heroapp.nullbore.com → show index/default tunnel
-					s.handleAccountSubdomainProxy(w, r, parts[0], "")
-					return
-				}
-			}
-		}
-
-		// Check if this is a custom domain request
-		if s.cfg.DomainResolver != nil && host != s.cfg.BaseDomain && !strings.HasSuffix(host, suffix) {
-			slug, _, err := s.cfg.DomainResolver.Resolve(host)
-			if err == nil && slug != "" {
-				s.handleSubdomainProxy(w, r, slug)
-				return
 			}
 		}
 
@@ -209,6 +260,17 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, slug string) {
 	t, ok := s.cfg.Registry.GetBySlug(slug)
 	if !ok {
+		writeNotFound(w)
+		return
+	}
+
+	// A tls-passthrough tunnel is only ever served by the SNI router, with
+	// the TLS session completed by the owner's key. Reaching it here means
+	// the relay (or a proxy in front of it) terminated TLS, or the request
+	// came in over plain HTTP — proxying it would expose its traffic in
+	// cleartext. Answer exactly like a nonexistent tunnel so this path is
+	// neither a plaintext leak nor an existence oracle.
+	if t.IsTLSPassthrough() {
 		writeNotFound(w)
 		return
 	}
@@ -372,7 +434,30 @@ func reconstructSubdomainRequest(r *http.Request, slug string) []byte {
 
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%s", s.cfg.Host, s.cfg.Port)
+	s.httpServer = s.newHTTPServer(addr)
 
+	if s.cfg.TLS == nil || !s.cfg.TLS.IsEnabled() {
+		// No TLS — plain HTTP, Host-header routing only. Passthrough
+		// tunnels are never served on this path (see handleSubdomainProxy).
+		return s.httpServer.ListenAndServe()
+	}
+
+	certFile, keyFile, err := s.configureTLS(addr)
+	if err != nil {
+		return err
+	}
+	// Mirrors http.Server.ListenAndServeTLS, with the SNI router in front.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	return s.serveTLS(ln, certFile, keyFile)
+}
+
+// newHTTPServer builds the http.Server with the full production handler
+// chain. Shared by ListenAndServe and the end-to-end tests.
+func (s *Server) newHTTPServer(addr string) *http.Server {
 	// Wrap with: request ID → logging → subdomain routing → mux.
 	// Request ID must be outermost so the logging middleware sees it for
 	// every request, and so the X-Request-ID response header is set even
@@ -386,7 +471,7 @@ func (s *Server) ListenAndServe() error {
 		handler.ServeHTTP(w, r)
 	})
 
-	s.httpServer = &http.Server{
+	return &http.Server{
 		Addr:         addr,
 		Handler:      versionHandler,
 		ReadTimeout:  15 * time.Second,
@@ -396,30 +481,32 @@ func (s *Server) ListenAndServe() error {
 		// This is the same approach used by chisel and similar tunnel servers.
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
+}
 
-	srv := s.httpServer
-
-	// TLS handling
-	if s.cfg.TLS != nil && s.cfg.TLS.IsEnabled() {
-		tlsConfig, err := s.cfg.TLS.BuildTLSConfig()
-		if err != nil {
-			return fmt.Errorf("tls setup: %w", err)
-		}
-		srv.TLSConfig = tlsConfig
-
-		if s.cfg.TLS.IsACME() {
-			// ACME mode — TLSConfig is fully managed by autocert
-			log.Printf("tls: listening on %s (ACME/Let's Encrypt)", addr)
-			return srv.ListenAndServeTLS("", "")
-		}
-
-		// Manual cert mode
-		log.Printf("tls: listening on %s (manual cert)", addr)
-		return srv.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+// configureTLS installs the TLS config on s.httpServer and returns the
+// cert/key file arguments for ServeTLS (both empty in ACME mode, where
+// TLSConfig is fully managed by autocert).
+func (s *Server) configureTLS(addr string) (certFile, keyFile string, err error) {
+	tlsConfig, err := s.cfg.TLS.BuildTLSConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("tls setup: %w", err)
 	}
+	s.httpServer.TLSConfig = tlsConfig
 
-	// No TLS
-	return srv.ListenAndServe()
+	if s.cfg.TLS.IsACME() {
+		log.Printf("tls: listening on %s (ACME/Let's Encrypt)", addr)
+		return "", "", nil
+	}
+	log.Printf("tls: listening on %s (manual cert)", addr)
+	return s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile, nil
+}
+
+// serveTLS serves HTTPS on ln behind the SNI router: connections whose
+// ClientHello names a tls-passthrough tunnel are piped, still encrypted, to
+// the tunnel client; everything else reaches the normal http.Server TLS stack
+// with the peeked bytes replayed, unchanged. Returns when the server stops.
+func (s *Server) serveTLS(ln net.Listener, certFile, keyFile string) error {
+	return s.httpServer.ServeTLS(newSNIListener(ln, s.passthroughFor), certFile, keyFile)
 }
 
 // Shutdown gracefully shuts down the server, waiting for active connections to finish.
@@ -444,15 +531,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // Any divergence here becomes an enumeration oracle for which accounts and
 // leaf names exist.
 func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Request, accountSub, tunnelName string) {
-	if s.cfg.SubdomainResolver == nil {
+	t, ok := s.lookupAccountTunnel(accountSub, tunnelName)
+	if !ok {
 		writeNotFound(w)
 		return
+	}
+	s.handleSubdomainProxy(w, r, t.Slug)
+}
+
+// lookupAccountTunnel resolves {tunnelName}.{accountSub}.{AccountDomain} to a
+// live tunnel. Every miss — resolver not configured, unknown account, bare
+// host, unknown leaf — returns (nil, false) identically; callers must not
+// distinguish them (see handleAccountSubdomainProxy's security model).
+func (s *Server) lookupAccountTunnel(accountSub, tunnelName string) (*tunnel.Tunnel, bool) {
+	if s.cfg.SubdomainResolver == nil {
+		return nil, false
 	}
 
 	userID, err := s.cfg.SubdomainResolver.Resolve(accountSub)
 	if err != nil || userID == "" {
-		writeNotFound(w)
-		return
+		return nil, false
 	}
 
 	if tunnelName == "" {
@@ -462,20 +560,46 @@ func (s *Server) handleAccountSubdomainProxy(w http.ResponseWriter, r *http.Requ
 		// non-deterministic and violates the rule that named tunnels must be
 		// reached via their exact named subdomain. A future opt-in default
 		// tunnel field on the account can re-enable bare-host routing.
-		writeNotFound(w)
-		return
+		return nil, false
 	}
 
 	// {leaf}.heroapp.nullbore.com — only an exact tunnel-name match proxies.
 	// Anything else is indistinguishable from "account does not exist".
-	tunnels := s.cfg.Registry.GetByClient(userID)
-	for _, t := range tunnels {
+	for _, t := range s.cfg.Registry.GetByClient(userID) {
 		if t.Slug == tunnelName {
-			s.handleSubdomainProxy(w, r, t.Slug)
-			return
+			return t, true
 		}
 	}
-	writeNotFound(w)
+	return nil, false
+}
+
+// resolveTunnelForHost maps a hostname to the tunnel that host-based routing
+// serves for it, applying exactly the namespace rules of subdomainHandler and
+// handleSubdomainProxy (shared via classifyHost / lookupAccountTunnel):
+// user-chosen slugs never resolve on the base domain, bare account hosts
+// never resolve, custom domains go through DomainResolver. Used by the TLS
+// SNI router to find passthrough tunnels before any TLS termination.
+func (s *Server) resolveTunnelForHost(host string) (*tunnel.Tunnel, bool) {
+	route := classifyHost(host, s.cfg.BaseDomain, s.cfg.AccountDomain)
+	switch route.Kind {
+	case routeBaseSlug:
+		if !isGeneratedSlug(route.Slug) {
+			return nil, false
+		}
+		return s.cfg.Registry.GetBySlug(route.Slug)
+	case routeAccount:
+		return s.lookupAccountTunnel(route.Account, route.Leaf)
+	case routeCustomDomain:
+		if s.cfg.DomainResolver == nil {
+			return nil, false
+		}
+		slug, _, err := s.cfg.DomainResolver.Resolve(host)
+		if err != nil || slug == "" {
+			return nil, false
+		}
+		return s.cfg.Registry.GetBySlug(slug)
+	}
+	return nil, false
 }
 
 // --- API Handlers ---
@@ -497,6 +621,33 @@ type createTunnelRequest struct {
 	Source     string `json:"source,omitempty"`      // "cli" or "daemon"
 	AuthUser   string `json:"auth_user,omitempty"`   // basic auth username
 	AuthPass   string `json:"auth_pass,omitempty"`   // basic auth password
+	// Mode is "relay" (default) or "tls-passthrough". Passthrough routes by
+	// TLS SNI without terminating, so the owner's own key completes the TLS
+	// session; it requires a paid tier and excludes basic auth.
+	Mode string `json:"mode,omitempty"`
+}
+
+// validateTunnelMode checks the requested mode against the caller's tier and
+// the other options, returning the normalised mode or an HTTP status and
+// error message. Pure, so it is unit-tested directly.
+func validateTunnelMode(req createTunnelRequest, tier string) (mode string, status int, errMsg string) {
+	mode = req.Mode
+	if mode == "" {
+		mode = tunnel.ModeRelay
+	}
+	if !tunnel.ValidMode(mode) {
+		return "", http.StatusBadRequest, fmt.Sprintf("invalid mode %q (want %q or %q)", req.Mode, tunnel.ModeRelay, tunnel.ModeTLSPassthrough)
+	}
+	if mode != tunnel.ModeTLSPassthrough {
+		return mode, 0, ""
+	}
+	if !tierIsPaid(tier) {
+		return "", http.StatusForbidden, "tls-passthrough mode requires a paid plan"
+	}
+	if req.AuthUser != "" || req.AuthPass != "" {
+		return "", http.StatusBadRequest, "basic auth (auth_user/auth_pass) cannot be combined with tls-passthrough mode: the relay never sees the HTTP traffic — enforce auth in your own server"
+	}
+	return mode, 0, ""
 }
 
 // tierMaxTTL returns the max TTL for a tier.
@@ -529,8 +680,9 @@ func (s *Server) checkTunnelAuth(w http.ResponseWriter, r *http.Request, t *tunn
 	return true
 }
 
-// checkProxyRateLimit returns true if the request is allowed through.
-func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bool {
+// allowProxyRequest consumes one token from the tunnel's per-tier proxy
+// rate limiter and reports whether the request/connection may proceed.
+func (s *Server) allowProxyRequest(t *tunnel.Tunnel) bool {
 	tier := t.Tier
 	if tier == "" {
 		tier = "free"
@@ -539,7 +691,12 @@ func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bo
 	if !ok {
 		limiter = s.proxyLimiters["free"]
 	}
-	if !limiter.Allow(t.ID) {
+	return limiter.Allow(t.ID)
+}
+
+// checkProxyRateLimit returns true if the request is allowed through.
+func (s *Server) checkProxyRateLimit(w http.ResponseWriter, t *tunnel.Tunnel) bool {
+	if !s.allowProxyRequest(t) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "429 Too Many Requests — tunnel rate limit exceeded", http.StatusTooManyRequests)
 		return false
@@ -611,6 +768,12 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 
 	if req.LocalPort < 1 || req.LocalPort > 65535 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "local_port must be 1-65535"})
+		return
+	}
+
+	mode, status, errMsg := validateTunnelMode(req, tier)
+	if status != 0 {
+		writeJSON(w, status, map[string]string{"error": errMsg})
 		return
 	}
 
@@ -701,6 +864,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		IdleTTL:    req.IdleTTL,
 		Source:     req.Source,
 		DeviceName: req.DeviceName,
+		Mode:       mode,
 	}
 	if opts.AuthUser == "" && req.AuthUser != "" && req.AuthPass != "" {
 		opts.AuthUser = req.AuthUser
@@ -726,10 +890,11 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 			LocalPort: t.LocalPort, Name: t.Name,
 			TTL: int64(ttl.Seconds()), Status: "active",
 			CreatedAt: t.CreatedAt, ExpiresAt: t.ExpiresAt,
+			Mode: mode,
 		})
 	}
 	if s.cfg.Events != nil {
-		s.cfg.Events.LogEvent(t.ID, t.ClientID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s", t.LocalPort, t.Slug, ttl))
+		s.cfg.Events.LogEvent(t.ID, t.ClientID, "created", fmt.Sprintf("port=%d slug=%s ttl=%s mode=%s", t.LocalPort, t.Slug, ttl, mode))
 	}
 
 	// Build response with public URL (use account subdomain if available)
@@ -938,7 +1103,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
 	t, ok := s.cfg.Registry.GetBySlug(slug)
-	if !ok {
+	if !ok || t.IsTLSPassthrough() {
+		// Passthrough tunnels are never served over the relay-terminated
+		// path (see handleSubdomainProxy); indistinguishable from a miss.
 		http.Error(w, "tunnel not found", http.StatusNotFound)
 		return
 	}
@@ -1242,6 +1409,10 @@ func (s *Server) handleSetInspection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
+	if req.Enabled && t.IsTLSPassthrough() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInspectionPassthrough})
+		return
+	}
 	if err := s.cfg.Registry.SetInspectionEnabled(id, req.Enabled); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -1256,6 +1427,11 @@ func (s *Server) handleSetInspection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"inspection_enabled": req.Enabled})
 }
 
+// errInspectionPassthrough is returned when enabling inspection on a
+// tls-passthrough tunnel: the relay only ever sees ciphertext for it, so
+// there is nothing to inspect, and request_log must stay empty.
+const errInspectionPassthrough = "request inspection is unavailable for tls-passthrough tunnels (the relay cannot see their HTTP traffic)"
+
 // handleAdminSetInspection is the admin-secret variant used by the dashboard
 // when proxying the toggle from the user-facing UI.
 func (s *Server) handleAdminSetInspection(w http.ResponseWriter, r *http.Request) {
@@ -1265,6 +1441,10 @@ func (s *Server) handleAdminSetInspection(w http.ResponseWriter, r *http.Request
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if t, ok := s.cfg.Registry.Get(id); ok && req.Enabled && t.IsTLSPassthrough() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": errInspectionPassthrough})
 		return
 	}
 	if err := s.cfg.Registry.SetInspectionEnabled(id, req.Enabled); err != nil {
@@ -1308,6 +1488,12 @@ func (s *Server) handleAdminReplayRequest(w http.ResponseWriter, r *http.Request
 	t, ok := s.cfg.Registry.Get(tunnelID)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	if t.IsTLSPassthrough() {
+		// Replay injects plaintext HTTP into the tunnel; a passthrough
+		// tunnel's local service expects a TLS ClientHello.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "replay is unavailable for tls-passthrough tunnels"})
 		return
 	}
 	if s.cfg.Events == nil {

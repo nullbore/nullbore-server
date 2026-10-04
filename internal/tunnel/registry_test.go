@@ -515,3 +515,49 @@ func TestSetInspectionEnabled(t *testing.T) {
 		t.Fatal("expected error for unknown tunnel id")
 	}
 }
+
+// TestCreateWithOptionsMode covers the mode default, explicit passthrough,
+// and that a reclaim (reconnect after restart) applies the newly requested
+// mode rather than keeping the old one.
+func TestCreateWithOptionsMode(t *testing.T) {
+	r := NewRegistry()
+
+	def, err := r.CreateWithOptions("c1", CreateOptions{LocalPort: 3000, TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Mode != ModeRelay || def.IsTLSPassthrough() {
+		t.Errorf("default mode = %q, want %q", def.Mode, ModeRelay)
+	}
+
+	pt, err := r.CreateWithOptions("c1", CreateOptions{LocalPort: 8443, TTL: time.Hour, Name: "books", Mode: ModeTLSPassthrough})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pt.IsTLSPassthrough() {
+		t.Errorf("mode = %q, want %q", pt.Mode, ModeTLSPassthrough)
+	}
+
+	// Reclaim the named tunnel (no active conn) as relay.
+	re, err := r.CreateWithOptions("c1", CreateOptions{LocalPort: 8443, TTL: time.Hour, Name: "books"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.ID != pt.ID {
+		t.Fatalf("expected reclaim of %s, got new tunnel %s", pt.ID, re.ID)
+	}
+	if re.IsTLSPassthrough() {
+		t.Errorf("reclaim kept mode %q, want %q", re.Mode, ModeRelay)
+	}
+}
+
+func TestValidMode(t *testing.T) {
+	for m, want := range map[string]bool{
+		ModeRelay: true, ModeTLSPassthrough: true,
+		"": false, "direct": false, "TLS-PASSTHROUGH": false, "tls": false,
+	} {
+		if got := ValidMode(m); got != want {
+			t.Errorf("ValidMode(%q) = %v, want %v", m, got, want)
+		}
+	}
+}

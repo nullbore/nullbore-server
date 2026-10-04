@@ -12,6 +12,27 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Tunnel modes.
+//
+// ModeRelay is the default: the relay terminates TLS on its own certificate,
+// parses HTTP, applies per-tunnel auth/limits/inspection and forwards the
+// request to the client.
+//
+// ModeTLSPassthrough routes a connection by the TLS ClientHello's SNI without
+// terminating it: the raw ciphertext is piped to the client, so the TLS
+// session is completed by the tunnel owner's own key and the relay cannot read
+// the traffic. HTTP-level features (basic auth, inspection, body limits,
+// status sniffing) are unavailable in this mode.
+const (
+	ModeRelay          = "relay"
+	ModeTLSPassthrough = "tls-passthrough"
+)
+
+// ValidMode reports whether m is a recognised tunnel mode.
+func ValidMode(m string) bool {
+	return m == ModeRelay || m == ModeTLSPassthrough
+}
+
 // Tunnel represents an active tunnel connection.
 type Tunnel struct {
 	ID        string    `json:"id"`
@@ -20,7 +41,7 @@ type Tunnel struct {
 	LocalPort int       `json:"local_port"`
 	Name      string    `json:"name,omitempty"`
 	TTL       Duration  `json:"ttl"`
-	Mode      string    `json:"mode"` // "relay" or "direct" (v1: always relay)
+	Mode      string    `json:"mode"` // ModeRelay (default) or ModeTLSPassthrough
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	BytesIn   int64     `json:"bytes_in"`
@@ -49,6 +70,15 @@ type Tunnel struct {
 	closed          bool
 	expiringWarned  bool
 	lastPing        time.Time // last control channel activity
+}
+
+// IsTLSPassthrough reports whether the tunnel is in TLS passthrough mode.
+// Reads under the tunnel mutex because a reclaim may rewrite Mode on a
+// published tunnel.
+func (t *Tunnel) IsTLSPassthrough() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.Mode == ModeTLSPassthrough
 }
 
 // Mu returns the tunnel's mutex for external synchronization (e.g., WebSocket writes).
@@ -236,6 +266,7 @@ type CreateOptions struct {
 	IdleTTL    bool
 	AuthUser   string // basic auth username (empty = no auth)
 	AuthPass   string // basic auth password
+	Mode       string // ModeRelay or ModeTLSPassthrough; empty = ModeRelay
 }
 
 // CreateWithOptions registers a new tunnel and returns it with all
@@ -258,6 +289,11 @@ func (r *Registry) CreateWithOptions(clientID string, opts CreateOptions) (*Tunn
 		if count >= r.limits.MaxTunnels {
 			return nil, fmt.Errorf("connection limit reached (%d tunnels)", r.limits.MaxTunnels)
 		}
+	}
+
+	mode := opts.Mode
+	if mode == "" {
+		mode = ModeRelay
 	}
 
 	ttl := opts.TTL
@@ -298,6 +334,7 @@ func (r *Registry) CreateWithOptions(clientID string, opts CreateOptions) (*Tunn
 					existing.IdleTTL = opts.IdleTTL
 					existing.AuthUser = opts.AuthUser
 					existing.AuthPass = opts.AuthPass
+					existing.Mode = mode
 					existing.mu.Unlock()
 					log.Printf("tunnel reclaimed: id=%s slug=%s client=%s",
 						existing.ID, existing.Slug, clientID)
@@ -318,7 +355,7 @@ func (r *Registry) CreateWithOptions(clientID string, opts CreateOptions) (*Tunn
 		LocalPort:  opts.LocalPort,
 		Name:       opts.Name,
 		TTL:        Duration(ttl),
-		Mode:       "relay",
+		Mode:       mode,
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(ttl),
 		Tier:       opts.Tier,
@@ -332,8 +369,8 @@ func (r *Registry) CreateWithOptions(clientID string, opts CreateOptions) (*Tunn
 	r.tunnels[t.ID] = t
 	r.slugs[t.Slug] = t.ID
 
-	log.Printf("tunnel created: id=%s slug=%s client=%s port=%d ttl=%s",
-		t.ID, t.Slug, t.ClientID, t.LocalPort, ttl)
+	log.Printf("tunnel created: id=%s slug=%s client=%s port=%d ttl=%s mode=%s",
+		t.ID, t.Slug, t.ClientID, t.LocalPort, ttl, mode)
 
 	r.emit(Event{Type: EventCreated, Tunnel: t})
 
