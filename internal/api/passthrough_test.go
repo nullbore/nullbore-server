@@ -397,25 +397,29 @@ func TestValidateTunnelMode(t *testing.T) {
 		name     string
 		req      createTunnelRequest
 		tier     string
+		self     bool
 		wantMode string
 		wantCode int
 	}{
-		{"default", createTunnelRequest{}, "free", tunnel.ModeRelay, 0},
-		{"explicit relay", createTunnelRequest{Mode: "relay"}, "", tunnel.ModeRelay, 0},
-		{"relay with auth", createTunnelRequest{AuthUser: "u", AuthPass: "p"}, "free", tunnel.ModeRelay, 0},
-		{"unknown", createTunnelRequest{Mode: "direct"}, "pro", "", 400},
-		{"wrong case", createTunnelRequest{Mode: "TLS-Passthrough"}, "pro", "", 400},
-		{"passthrough free", createTunnelRequest{Mode: "tls-passthrough"}, "free", "", 403},
-		{"passthrough no tier", createTunnelRequest{Mode: "tls-passthrough"}, "", "", 403},
-		{"passthrough basic", createTunnelRequest{Mode: "tls-passthrough"}, "basic", tunnel.ModeTLSPassthrough, 0},
-		{"passthrough plus", createTunnelRequest{Mode: "tls-passthrough"}, "plus", tunnel.ModeTLSPassthrough, 0},
-		{"passthrough legacy dev", createTunnelRequest{Mode: "tls-passthrough"}, "dev", tunnel.ModeTLSPassthrough, 0},
-		{"passthrough pro", createTunnelRequest{Mode: "tls-passthrough"}, "pro", tunnel.ModeTLSPassthrough, 0},
-		{"passthrough + auth", createTunnelRequest{Mode: "tls-passthrough", AuthUser: "u", AuthPass: "p"}, "pro", "", 400},
-		{"passthrough + user only", createTunnelRequest{Mode: "tls-passthrough", AuthUser: "u"}, "pro", "", 400},
+		{"default", createTunnelRequest{}, "free", false, tunnel.ModeRelay, 0},
+		{"explicit relay", createTunnelRequest{Mode: "relay"}, "", false, tunnel.ModeRelay, 0},
+		{"relay with auth", createTunnelRequest{AuthUser: "u", AuthPass: "p"}, "free", false, tunnel.ModeRelay, 0},
+		{"unknown", createTunnelRequest{Mode: "direct"}, "pro", false, "", 400},
+		{"wrong case", createTunnelRequest{Mode: "TLS-Passthrough"}, "pro", false, "", 400},
+		{"passthrough free", createTunnelRequest{Mode: "tls-passthrough"}, "free", false, "", 403},
+		{"passthrough no tier", createTunnelRequest{Mode: "tls-passthrough"}, "", false, "", 403},
+		{"passthrough basic", createTunnelRequest{Mode: "tls-passthrough"}, "basic", false, tunnel.ModeTLSPassthrough, 0},
+		{"passthrough plus", createTunnelRequest{Mode: "tls-passthrough"}, "plus", false, tunnel.ModeTLSPassthrough, 0},
+		{"passthrough legacy dev", createTunnelRequest{Mode: "tls-passthrough"}, "dev", false, tunnel.ModeTLSPassthrough, 0},
+		{"passthrough pro", createTunnelRequest{Mode: "tls-passthrough"}, "pro", false, tunnel.ModeTLSPassthrough, 0},
+		{"passthrough + auth", createTunnelRequest{Mode: "tls-passthrough", AuthUser: "u", AuthPass: "p"}, "pro", false, "", 400},
+		{"passthrough + user only", createTunnelRequest{Mode: "tls-passthrough", AuthUser: "u"}, "pro", false, "", 400},
+		{"self-hosted passthrough, no tier", createTunnelRequest{Mode: "tls-passthrough"}, "", true, tunnel.ModeTLSPassthrough, 0},
+		{"self-hosted explicit free", createTunnelRequest{Mode: "tls-passthrough"}, "free", true, "", 403},
+		{"self-hosted passthrough + auth", createTunnelRequest{Mode: "tls-passthrough", AuthUser: "u"}, "", true, "", 400},
 	}
 	for _, c := range cases {
-		mode, code, msg := validateTunnelMode(c.req, c.tier)
+		mode, code, msg := validateTunnelMode(c.req, c.tier, c.self)
 		if mode != c.wantMode || code != c.wantCode {
 			t.Errorf("%s: got (%q, %d, %q), want (%q, %d)", c.name, mode, code, msg, c.wantMode, c.wantCode)
 		}
@@ -1101,4 +1105,18 @@ func TestTLSPassthroughEndToEnd(t *testing.T) {
 			t.Error("second conn should have been closed by the rate limiter")
 		}
 	})
+}
+
+func TestIsSelfHostedAuth(t *testing.T) {
+	static := auth.NewStaticProvider("k1")
+	remote := auth.NewRemoteProvider("http://dash.invalid", "s")
+	if !isSelfHostedAuth(static) {
+		t.Error("static provider should be self-hosted")
+	}
+	if isSelfHostedAuth(remote) {
+		t.Error("remote provider should not be self-hosted")
+	}
+	if isSelfHostedAuth(&auth.ComboProvider{Primary: remote, Fallback: static}) {
+		t.Error("combo (dashboard + static fallback) should not be self-hosted")
+	}
 }

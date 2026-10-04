@@ -630,7 +630,12 @@ type createTunnelRequest struct {
 // validateTunnelMode checks the requested mode against the caller's tier and
 // the other options, returning the normalised mode or an HTTP status and
 // error message. Pure, so it is unit-tested directly.
-func validateTunnelMode(req createTunnelRequest, tier string) (mode string, status int, errMsg string) {
+//
+// selfHosted is true when the server has no dashboard-backed auth (static keys
+// only): tiers don't exist there, and self-hosted is "unlimited everything",
+// so the paid-plan gate is skipped for tierless keys. An explicit "free"
+// tier is always refused.
+func validateTunnelMode(req createTunnelRequest, tier string, selfHosted bool) (mode string, status int, errMsg string) {
 	mode = req.Mode
 	if mode == "" {
 		mode = tunnel.ModeRelay
@@ -641,13 +646,24 @@ func validateTunnelMode(req createTunnelRequest, tier string) (mode string, stat
 	if mode != tunnel.ModeTLSPassthrough {
 		return mode, 0, ""
 	}
-	if !tierIsPaid(tier) {
+	if !tierIsPaid(tier) && !(selfHosted && tier == "") {
 		return "", http.StatusForbidden, "tls-passthrough mode requires a paid plan"
 	}
 	if req.AuthUser != "" || req.AuthPass != "" {
 		return "", http.StatusBadRequest, "basic auth (auth_user/auth_pass) cannot be combined with tls-passthrough mode: the relay never sees the HTTP traffic — enforce auth in your own server"
 	}
 	return mode, 0, ""
+}
+
+// isSelfHostedAuth reports whether p validates keys without the dashboard
+// (static keys only). Dashboard-backed setups use RemoteProvider, alone or
+// inside a ComboProvider with a static fallback.
+func isSelfHostedAuth(p auth.Provider) bool {
+	switch p.(type) {
+	case *auth.RemoteProvider, *auth.ComboProvider:
+		return false
+	}
+	return true
 }
 
 // tierMaxTTL returns the max TTL for a tier.
@@ -771,7 +787,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode, status, errMsg := validateTunnelMode(req, tier)
+	mode, status, errMsg := validateTunnelMode(req, tier, isSelfHostedAuth(s.cfg.Auth))
 	if status != 0 {
 		writeJSON(w, status, map[string]string{"error": errMsg})
 		return
