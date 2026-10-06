@@ -159,7 +159,14 @@ type hostRoute struct {
 	Slug    string // routeBaseSlug
 	Account string // routeAccount
 	Leaf    string // routeAccount; "" for a bare account host
+	E2E     bool   // routeAccount via {leaf}.{account}.e2e.{AccountDomain}: tls-passthrough only
 }
+
+// e2eLabel marks the end-to-end namespace under the account domain:
+// {leaf}.{account}.e2e.nullbore.com. Those hostnames are meant to be DNS-only
+// (not Cloudflare-proxied) so the TLS ClientHello reaches the relay intact,
+// and they only ever route tls-passthrough tunnels.
+const e2eLabel = "e2e"
 
 // classifyHost decides which routing plane a hostname (port already
 // stripped) belongs to. It is pure — no registry or resolver lookups — so the
@@ -173,6 +180,8 @@ type hostRoute struct {
 //     other than "tunnel"/"www" → bare routeAccount (Leaf ""). Deeper names
 //     split at the first dot, so the account segment contains a dot and
 //     never resolves.
+//   - {leaf}.{account}.e2e under AccountDomain (exactly three labels) →
+//     routeAccount with E2E set; served only for tls-passthrough tunnels.
 //   - not BaseDomain and not under it → routeCustomDomain.
 //   - otherwise (BaseDomain itself, multi-label names under it that are not
 //     account hosts) → routeNone.
@@ -195,6 +204,9 @@ func classifyHost(host, baseDomain, accountDomain string) hostRoute {
 		acctSuffix := "." + accountDomain
 		if strings.HasSuffix(host, acctSuffix) && host != accountDomain {
 			sub := strings.TrimSuffix(host, acctSuffix)
+			if e2e := strings.Split(sub, "."); len(e2e) == 3 && e2e[2] == e2eLabel && e2e[0] != "" && e2e[1] != "" {
+				return hostRoute{Kind: routeAccount, Account: e2e[1], Leaf: e2e[0], E2E: true}
+			}
 			parts := strings.SplitN(sub, ".", 2)
 			if len(parts) == 2 {
 				// Two-level: web.heroapp.nullbore.com → tunnel="web", account="heroapp"
@@ -234,6 +246,14 @@ func (s *Server) subdomainHandler(next http.Handler) http.Handler {
 			s.handleSubdomainProxy(w, r, route.Slug)
 			return
 		case routeAccount:
+			if route.E2E {
+				// The e2e namespace only carries tls-passthrough tunnels,
+				// which the SNI router serves before TLS is terminated. An
+				// HTTP request here means TLS was terminated (or never
+				// used), so nothing may be proxied.
+				writeNotFound(w)
+				return
+			}
 			s.handleAccountSubdomainProxy(w, r, route.Account, route.Leaf)
 			return
 		case routeCustomDomain:
@@ -588,7 +608,11 @@ func (s *Server) resolveTunnelForHost(host string) (*tunnel.Tunnel, bool) {
 		}
 		return s.cfg.Registry.GetBySlug(route.Slug)
 	case routeAccount:
-		return s.lookupAccountTunnel(route.Account, route.Leaf)
+		t, ok := s.lookupAccountTunnel(route.Account, route.Leaf)
+		if ok && route.E2E && !t.IsTLSPassthrough() {
+			return nil, false
+		}
+		return t, ok
 	case routeCustomDomain:
 		if s.cfg.DomainResolver == nil {
 			return nil, false

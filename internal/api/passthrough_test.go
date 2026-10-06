@@ -299,6 +299,12 @@ func TestClassifyHost(t *testing.T) {
 		{"web.heroapp.nullbore.com", hostRoute{Kind: routeAccount, Account: "heroapp", Leaf: "web"}},
 		{"heroapp.nullbore.com", hostRoute{Kind: routeAccount, Account: "heroapp"}},
 		{"a.b.c.nullbore.com", hostRoute{Kind: routeAccount, Account: "b.c", Leaf: "a"}},
+		// End-to-end namespace: {leaf}.{account}.e2e.{AccountDomain}.
+		{"web.heroapp.e2e.nullbore.com", hostRoute{Kind: routeAccount, Account: "heroapp", Leaf: "web", E2E: true}},
+		// Two labels ending in e2e are an ordinary account named "e2e".
+		{"web.e2e.nullbore.com", hostRoute{Kind: routeAccount, Account: "e2e", Leaf: "web"}},
+		// Deeper or empty-label e2e names never get the E2E route.
+		{"a.web.heroapp.e2e.nullbore.com", hostRoute{Kind: routeAccount, Account: "web.heroapp.e2e", Leaf: "a"}},
 		// Multi-label under the base domain falls to the account plane
 		// (account "y.tunnel" never resolves) — same as before the refactor.
 		{"x.y.tunnel.nullbore.com", hostRoute{Kind: routeAccount, Account: "y.tunnel", Leaf: "x"}},
@@ -344,6 +350,7 @@ func TestResolveTunnelForHost(t *testing.T) {
 	registry := tunnel.NewRegistry()
 	gen, _ := registry.CreateWithOptions("user-2", tunnel.CreateOptions{LocalPort: 1, TTL: time.Hour})
 	shark, _ := registry.CreateWithOptions("user-1", tunnel.CreateOptions{LocalPort: 2, TTL: time.Hour, Name: "shark", Mode: tunnel.ModeTLSPassthrough})
+	whale, _ := registry.CreateWithOptions("user-1", tunnel.CreateOptions{LocalPort: 3, TTL: time.Hour, Name: "whale"})
 
 	srv := NewServer(Config{
 		Auth:              auth.NewStaticProvider("nbk_test_secret"),
@@ -368,11 +375,32 @@ func TestResolveTunnelForHost(t *testing.T) {
 		{"books.example.org", shark},
 		{"unknown.example.org", nil},
 		{"a.b.tunnel.nullbore.com", nil},
+		{"whale.heroapp.nullbore.com", whale},
+		// e2e namespace: passthrough tunnels only.
+		{"shark.heroapp.e2e.nullbore.com", shark},
+		{"whale.heroapp.e2e.nullbore.com", nil},
+		{"shark.fake.e2e.nullbore.com", nil},
 	}
 	for _, c := range cases {
 		got, ok := srv.resolveTunnelForHost(c.host)
 		if (c.want == nil) != !ok || (c.want != nil && got != c.want) {
 			t.Errorf("resolveTunnelForHost(%q) = %v,%v; want %v", c.host, got, ok, c.want)
+		}
+	}
+
+	if srv.passthroughFor("shark.heroapp.e2e.nullbore.com") == nil {
+		t.Error("passthroughFor returned nil for a passthrough tunnel in the e2e namespace")
+	}
+
+	// Over HTTP (TLS already terminated, or plain HTTP) the e2e namespace
+	// proxies nothing — not even a relay tunnel — and looks like a miss.
+	h := srv.newHTTPServer("").Handler
+	for _, host := range []string{"whale.heroapp.e2e.nullbore.com", "shark.heroapp.e2e.nullbore.com"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://"+host+"/", nil)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("HTTP %s: status %d, want 404", host, rec.Code)
 		}
 	}
 

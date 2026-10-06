@@ -98,6 +98,15 @@ self-signed origin certificate is rejected). Passthrough hostnames must be
 forwards raw TCP without terminating TLS). DNS is managed outside this
 server.
 
+For account tunnels there is a dedicated end-to-end namespace,
+`{tunnel}.{account}.e2e.{account-domain}` (e.g.
+`books.abookify.e2e.nullbore.com`), so an account's passthrough hostnames
+can be DNS-only while its ordinary `{tunnel}.{account}.{account-domain}`
+hostnames stay behind the CDN. One DNS-only wildcard per account
+(`*.{account}.e2e.{account-domain}` → relay IP) covers it. The e2e namespace
+only ever routes tls-passthrough tunnels; anything else there, and any
+plain-HTTP or TLS-terminated request to it, gets the generic 404.
+
 ### Verifying it
 
 Run from outside your LAN. The presented fingerprint must equal your own
