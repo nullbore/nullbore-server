@@ -49,6 +49,7 @@ type Config struct {
 	SubdomainResolver *SubdomainResolver // account subdomain → user ID resolver (optional)
 	IPChecker         IPCheckerProvider  // optional; nil means allow all IPs
 	MaxBodyBytes      int64              // max request body size (0 = unlimited, default 500MB)
+	ACME              ACMEDelegator      // ACME DNS-01 TXT delegation (optional; nil → /v1/acme/dns-01 returns 501)
 
 	// TrustedProxies is the set of CIDRs whose `X-Forwarded-For` headers
 	// will be honored for client-IP determination (used by IP allowlists,
@@ -68,6 +69,10 @@ type Server struct {
 	// Per-tunnel request rate limiters, keyed by tier
 	proxyLimiters map[string]*RateLimiter
 	httpServer    *http.Server
+	// acmeLimiter bounds ACME DNS-01 record creations per user.
+	acmeLimiter *RateLimiter
+	// accountOf overrides callerAccount in tests (nil = RemoteProvider cache).
+	accountOf func(*http.Request) string
 }
 
 func NewServer(cfg Config) *Server {
@@ -86,6 +91,8 @@ func NewServer(cfg Config) *Server {
 			"dev":   NewRateLimiter(1000, time.Second, 2000),   // legacy alias
 			"pro":   NewRateLimiter(10000, time.Second, 10000), // practically unlimited
 		},
+		// ACME DNS-01: burst of 30, refilling one every 2 minutes (~30/hour).
+		acmeLimiter: NewRateLimiter(1, time.Hour/acmeCreatesPerHour, acmeCreatesPerHour),
 	}
 	s.routes()
 	return s
@@ -123,6 +130,8 @@ func (s *Server) routes() {
 	api.HandleFunc("POST /v1/tunnels/{id}/extend", s.handleExtendTunnel)
 	api.HandleFunc("GET /v1/tunnels/{id}/requests", s.handleListRequests)
 	api.HandleFunc("POST /v1/tunnels/{id}/inspection", s.handleSetInspection)
+	api.HandleFunc("POST /v1/acme/dns-01", s.handleACMEDNS01)
+	api.HandleFunc("DELETE /v1/acme/dns-01", s.handleACMEDNS01)
 
 	s.mux.Handle("/v1/", s.cfg.Auth.Middleware(api))
 

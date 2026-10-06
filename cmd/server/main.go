@@ -305,6 +305,14 @@ func main() {
 	if remoteProvider != nil {
 		cfg.IPChecker = remoteProvider
 	}
+	// ACME DNS-01 delegation (POST/DELETE /v1/acme/dns-01): the dashboard
+	// owns the DNS zone and writes the _acme-challenge TXT records. Needs the
+	// dashboard link and an account domain; otherwise the endpoint is 501.
+	// Same typed-nil caveat as IPChecker: only assign a real client.
+	if *webhookTarget != "" && *webhookSecret != "" && *accountDomain != "" {
+		cfg.ACME = api.NewACMEDashboardClient(*webhookTarget, *webhookSecret)
+		slog.Info("acme dns-01 delegation enabled", "zone", "e2e."+*accountDomain)
+	}
 
 	if *baseDomain != "" {
 		log.Printf("subdomain routing: *.%s", *baseDomain)

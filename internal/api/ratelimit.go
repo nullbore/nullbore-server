@@ -96,10 +96,25 @@ func (rl *RateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	cutoff := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-rl.idleTTL())
 	for key, b := range rl.buckets {
 		if b.lastFill.Before(cutoff) {
 			delete(rl.buckets, key)
 		}
 	}
+}
+
+// idleTTL is how long a bucket may go without a refill before cleanup drops
+// it. Dropping a bucket hands the key a fresh full burst, so it must not
+// happen before the bucket would have refilled to full on its own — otherwise
+// a slow-refill limiter (e.g. 30/hour) resets every few minutes.
+func (rl *RateLimiter) idleTTL() time.Duration {
+	ttl := 10 * time.Minute
+	if rl.rate > 0 {
+		refills := (rl.burst + rl.rate - 1) / rl.rate
+		if full := time.Duration(refills) * rl.interval; full > ttl {
+			ttl = full
+		}
+	}
+	return ttl
 }
