@@ -944,7 +944,7 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		PublicURL string `json:"public_url"`
 	}{
 		Tunnel:    t,
-		PublicURL: s.publicURLForClient(t.Slug, token),
+		PublicURL: s.publicURLForClient(t, token),
 	}
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -960,7 +960,7 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	result := make([]tunnelWithURL, 0, len(tunnels))
 	for _, t := range tunnels {
-		result = append(result, tunnelWithURL{Tunnel: t, PublicURL: s.publicURLForClient(t.Slug, token)})
+		result = append(result, tunnelWithURL{Tunnel: t, PublicURL: s.publicURLForClient(t, token)})
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -980,7 +980,7 @@ func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		*tunnel.Tunnel
 		PublicURL string `json:"public_url"`
-	}{Tunnel: t, PublicURL: s.publicURLForClient(t.Slug, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))}
+	}{Tunnel: t, PublicURL: s.publicURLForClient(t, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1697,14 +1697,27 @@ func (s *Server) publicURL(slug string) string {
 // publicURLForClient returns the URL using the user's account subdomain if they have one.
 // With account subdomain: https://web.heroapp.nullbore.com
 // Without: https://slug.tunnel.nullbore.com
-func (s *Server) publicURLForClient(slug, token string) string {
+func (s *Server) publicURLForClient(t *tunnel.Tunnel, token string) string {
+	var accountSub string
 	if rp := getRemoteProvider(s.cfg.Auth); rp != nil && token != "" {
-		if sub := rp.GetSubdomain(token); sub != "" && s.cfg.AccountDomain != "" {
-			return fmt.Sprintf("https://%s.%s.%s", slug, sub, s.cfg.AccountDomain)
-		}
+		accountSub = rp.GetSubdomain(token)
 	}
-	if s.cfg.BaseDomain != "" {
-		return fmt.Sprintf("https://%s.%s", slug, s.cfg.BaseDomain)
+	return publicURL(t.Slug, accountSub, s.cfg.AccountDomain, s.cfg.BaseDomain, t.IsTLSPassthrough())
+}
+
+// publicURL builds a tunnel's public URL. Account tunnels use the account
+// subdomain; tls-passthrough account tunnels use the e2e namespace
+// ({slug}.{account}.e2e.{AccountDomain}), whose DNS is not CDN-proxied —
+// the plain account hostname is, and would never reach the SNI router.
+func publicURL(slug, accountSub, accountDomain, baseDomain string, passthrough bool) string {
+	if accountSub != "" && accountDomain != "" {
+		if passthrough {
+			return fmt.Sprintf("https://%s.%s.%s.%s", slug, accountSub, e2eLabel, accountDomain)
+		}
+		return fmt.Sprintf("https://%s.%s.%s", slug, accountSub, accountDomain)
+	}
+	if baseDomain != "" {
+		return fmt.Sprintf("https://%s.%s", slug, baseDomain)
 	}
 	return fmt.Sprintf("/t/%s", slug)
 }

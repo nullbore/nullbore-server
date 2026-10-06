@@ -1148,3 +1148,30 @@ func TestIsSelfHostedAuth(t *testing.T) {
 		t.Error("combo (dashboard + static fallback) should not be self-hosted")
 	}
 }
+
+func TestPublicURL(t *testing.T) {
+	const base, acct = "tunnel.nullbore.com", "nullbore.com"
+	cases := []struct {
+		slug, sub   string
+		passthrough bool
+		want        string
+	}{
+		{"web", "heroapp", false, "https://web.heroapp.nullbore.com"},
+		{"web", "heroapp", true, "https://web.heroapp.e2e.nullbore.com"},
+		{"abc123def456", "", false, "https://abc123def456.tunnel.nullbore.com"},
+		{"abc123def456", "", true, "https://abc123def456.tunnel.nullbore.com"},
+	}
+	for _, c := range cases {
+		if got := publicURL(c.slug, c.sub, acct, base, c.passthrough); got != c.want {
+			t.Errorf("publicURL(%q,%q,%v) = %q, want %q", c.slug, c.sub, c.passthrough, got, c.want)
+		}
+		// The URL we hand out must route back to the tunnel's own plane.
+		host := strings.TrimPrefix(c.want, "https://")
+		if r := classifyHost(host, base, acct); c.sub != "" && (r.Leaf != c.slug || r.Account != c.sub || r.E2E != c.passthrough) {
+			t.Errorf("publicURL %q classifies as %+v", c.want, r)
+		}
+	}
+	if got := publicURL("x", "", "", "", true); got != "/t/x" {
+		t.Errorf("no domains: got %q", got)
+	}
+}
