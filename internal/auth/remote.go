@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,7 +22,18 @@ type RemoteProvider struct {
 	// Cache valid keys: rawKey -> cacheEntry
 	mu    sync.RWMutex
 	cache map[string]*cacheEntry
+
+	// dashStatus is the last observed state of the relay→dashboard link
+	// (one of the Dashboard* constants); empty until the first check.
+	dashStatus atomic.Value
 }
+
+// States of the relay→dashboard link, reported on /health.
+const (
+	DashboardOK             = "ok"
+	DashboardSecretMismatch = "secret_mismatch" // dashboard 403s our X-Internal-Secret
+	DashboardUnreachable    = "unreachable"
+)
 
 type cacheEntry struct {
 	clientID       string
@@ -110,6 +122,13 @@ func (p *RemoteProvider) ValidateWithDevice(token, deviceID, deviceHostname stri
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden {
+		// Not a bad user key: the dashboard rejected OUR shared secret, so
+		// every key is being refused. Say so loudly instead of looking like
+		// an ordinary "invalid API key".
+		p.setDashboardStatus(DashboardSecretMismatch)
+		return "", false
+	}
 	if resp.StatusCode != 200 {
 		return "", false
 	}
@@ -243,6 +262,63 @@ func (p *RemoteProvider) Middleware(next http.Handler) http.Handler {
 		r = r.WithContext(WithClientID(r.Context(), clientID))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// CheckDashboard probes /internal/validate-key with a throwaway token. With
+// the right shared secret the dashboard answers 200 {"valid":false}; with a
+// wrong one it answers 403. Records and returns the resulting state.
+func (p *RemoteProvider) CheckDashboard() string {
+	req, err := http.NewRequest("POST", p.dashboardURL+"/internal/validate-key", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		p.setDashboardStatus(DashboardUnreachable)
+		return DashboardUnreachable
+	}
+	req.Header.Set("Authorization", "Bearer nbk_relay_healthcheck")
+	req.Header.Set("Content-Type", "application/json")
+	if p.secret != "" {
+		req.Header.Set("X-Internal-Secret", p.secret)
+	}
+	status := DashboardUnreachable
+	if resp, err := p.client.Do(req); err == nil {
+		resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusOK:
+			status = DashboardOK
+		case http.StatusForbidden:
+			status = DashboardSecretMismatch
+		}
+	}
+	p.setDashboardStatus(status)
+	return status
+}
+
+// DashboardStatus returns the last observed dashboard link state ("" before
+// the first check).
+func (p *RemoteProvider) DashboardStatus() string {
+	s, _ := p.dashStatus.Load().(string)
+	return s
+}
+
+func (p *RemoteProvider) setDashboardStatus(s string) {
+	prev := p.DashboardStatus()
+	p.dashStatus.Store(s)
+	if s == DashboardSecretMismatch {
+		log.Printf("ERROR auth: dashboard rejected the relay's -webhook-secret (403) — it differs from the dashboard's -internal-secret, so EVERY API key is refused. Make the two values match and restart.")
+	} else if s != prev && prev != "" {
+		log.Printf("auth: dashboard link %s -> %s", prev, s)
+	}
+}
+
+// StartDashboardCheck checks the dashboard link now and then every interval,
+// so a secret mismatch shows up in the log and on /health right after a
+// restart instead of as "invalid API key" reports from users.
+func (p *RemoteProvider) StartDashboardCheck(interval time.Duration) {
+	go func() {
+		for {
+			p.CheckDashboard()
+			time.Sleep(interval)
+		}
+	}()
 }
 
 // StartCacheReaper periodically cleans expired cache entries.

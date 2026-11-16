@@ -80,6 +80,7 @@ func main() {
 	if *webhookTarget != "" && *webhookSecret != "" {
 		remoteProvider = auth.NewRemoteProvider(*webhookTarget, *webhookSecret)
 		remoteProvider.StartCacheReaper()
+		remoteProvider.StartDashboardCheck(5 * time.Minute)
 		slog.Info("auth: remote validation", "target", *webhookTarget)
 
 		// Use a combo provider: try remote first, fall back to static
@@ -304,6 +305,7 @@ func main() {
 	// the path-based proxy path (handleProxy → GetIPAllowlistForUser).
 	if remoteProvider != nil {
 		cfg.IPChecker = remoteProvider
+		cfg.DashboardStatus = remoteProvider.DashboardStatus
 	}
 	// ACME DNS-01 delegation (POST/DELETE /v1/acme/dns-01): the dashboard
 	// owns the DNS zone and writes the _acme-challenge TXT records. Needs the

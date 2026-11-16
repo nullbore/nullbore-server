@@ -50,6 +50,9 @@ type Config struct {
 	IPChecker         IPCheckerProvider  // optional; nil means allow all IPs
 	MaxBodyBytes      int64              // max request body size (0 = unlimited, default 500MB)
 	ACME              ACMEDelegator      // ACME DNS-01 TXT delegation (optional; nil → /v1/acme/dns-01 returns 501)
+	// DashboardStatus reports the relay→dashboard link state for /health
+	// (optional; nil when there is no dashboard, e.g. self-hosted).
+	DashboardStatus func() string
 
 	// TrustedProxies is the set of CIDRs whose `X-Forwarded-For` headers
 	// will be honored for client-IP determination (used by IP allowlists,
@@ -638,11 +641,22 @@ func (s *Server) resolveTunnelForHost(host string) (*tunnel.Tunnel, bool) {
 // --- API Handlers ---
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
+	body := map[string]string{
 		"status":      "ok",
 		"version":     ServerVersion,
 		"api_version": APIVersion,
-	})
+	}
+	// Stays 200 so a dashboard problem never takes the relay out of
+	// rotation; monitors read "dashboard" / "status" instead.
+	if s.cfg.DashboardStatus != nil {
+		if d := s.cfg.DashboardStatus(); d != "" {
+			body["dashboard"] = d
+			if d != auth.DashboardOK {
+				body["status"] = "degraded"
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 type createTunnelRequest struct {

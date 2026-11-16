@@ -1,0 +1,30 @@
+name: Monitor prod
+
+# Every 30 minutes: fail (GitHub emails the repo owner) if the relay is down
+# or can't authenticate to the dashboard. A shared-secret mismatch makes the
+# relay refuse every API key while /health still answers, so check the
+# "dashboard" field, not just the status code.
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Relay health + dashboard link
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS --retry 3 --retry-delay 10 https://tunnel.nullbore.com/health)"
+          echo "health: $body"
+          dash="$(printf '%s' "$body" | jq -r '.dashboard // "missing"')"
+          if [ "$dash" != "ok" ]; then
+            echo "::error::relay→dashboard link is '$dash' — every API key is being refused. Compare -webhook-secret (relay unit) with -internal-secret (dashboard unit), fix, daemon-reload + restart."
+            exit 1
+          fi
+      - name: Dashboard up
+        run: curl -fsS --retry 3 --retry-delay 10 -o /dev/null https://nullbore.com/health

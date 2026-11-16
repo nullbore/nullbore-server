@@ -52,6 +52,30 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestHealthReportsDashboardLink(t *testing.T) {
+	for _, tc := range []struct{ dash, wantStatus string }{
+		{auth.DashboardOK, "ok"},
+		{auth.DashboardSecretMismatch, "degraded"},
+		{auth.DashboardUnreachable, "degraded"},
+	} {
+		srv := NewServer(Config{
+			Auth:            auth.NewStaticProvider("nbk_test_secret"),
+			Registry:        tunnel.NewRegistry(),
+			DashboardStatus: func() string { return tc.dash },
+		})
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+		if rec.Code != 200 {
+			t.Fatalf("%s: code %d, want 200", tc.dash, rec.Code)
+		}
+		var body map[string]string
+		json.NewDecoder(rec.Body).Decode(&body)
+		if body["dashboard"] != tc.dash || body["status"] != tc.wantStatus {
+			t.Errorf("%s: got dashboard=%q status=%q, want %q/%q", tc.dash, body["dashboard"], body["status"], tc.dash, tc.wantStatus)
+		}
+	}
+}
+
 func TestCreateTunnel(t *testing.T) {
 	_, ts := newTestServer("nbk_test_secret")
 	defer ts.Close()

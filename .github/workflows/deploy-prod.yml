@@ -72,9 +72,20 @@ jobs:
           systemctl is-active --quiet nullbore-server
           EOF
 
-          # Health check
+          # Health check — fail the deploy if the relay can't authenticate to
+          # the dashboard (shared-secret mismatch = every API key refused).
           HEALTH_URL="${PROD_HEALTH_URL:-https://tunnel.nullbore.com/health}"
-          curl -fsS "$HEALTH_URL" || echo "::warning::Health check failed (may need manual verification)"
+          for i in $(seq 1 10); do
+            body="$(curl -fsS "$HEALTH_URL" || true)"
+            dash="$(printf '%s' "$body" | jq -r '.dashboard // empty' 2>/dev/null || true)"
+            [ -n "$dash" ] && break
+            sleep 3
+          done
+          echo "health: $body"
+          if [ "$dash" != "ok" ]; then
+            echo "::error::relay→dashboard link is '${dash:-unknown}' — check -webhook-secret (relay) vs -internal-secret (dashboard)"
+            exit 1
+          fi
 
       - name: Deploy summary
         run: echo "✅ Tunnel server deploy complete" >> "$GITHUB_STEP_SUMMARY"
